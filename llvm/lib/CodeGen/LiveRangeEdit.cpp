@@ -22,7 +22,7 @@
 
 using namespace llvm;
 
-#define DEBUG_TYPE "regalloc"
+#define DEBUG_TYPE "liverange"
 
 STATISTIC(NumDCEDeleted,        "Number of instructions deleted by DCE");
 STATISTIC(NumDCEFoldedLoads,    "Number of single use loads folded after DCE");

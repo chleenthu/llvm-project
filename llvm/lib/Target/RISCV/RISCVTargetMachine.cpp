@@ -151,6 +151,8 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeRISCVTarget() {
   initializeRISCVRedundantCopyEliminationPass(*PR);
   initializeRISCVAsmPrinterPass(*PR);
   initializeRISCVPromoteConstantPass(*PR);
+  initializeExpandPseudosPass(*PR);
+  initializeRISCVRegisterPressurePass(*PR);
 }
 
 static Reloc::Model getEffectiveRelocModel(const Triple &TT,
@@ -396,6 +398,7 @@ public:
     return getTM<RISCVTargetMachine>();
   }
 
+  void addOptimizedRegAlloc() override;
   void addIRPasses() override;
   bool addPreISel() override;
   void addCodeGenPrepare() override;
@@ -463,6 +466,17 @@ bool RISCVPassConfig::addRegAssignAndRewriteOptimized() {
     addPass(createRISCVDeadRegisterDefinitionsPass());
   return TargetPassConfig::addRegAssignAndRewriteOptimized();
 }
+
+
+void RISCVPassConfig::addOptimizedRegAlloc() {
+  if (getOptimizeRegAlloc())
+    insertPass(&DetectDeadLanesID, &InitUndefID);
+
+  insertPass(&MachineSchedulerID, &ExpandPseudosID);
+  insertPass(&MachineSchedulerID, &RISCVRegisterPressureID);
+  TargetPassConfig::addOptimizedRegAlloc();
+}
+
 
 void RISCVPassConfig::addIRPasses() {
   addPass(createAtomicExpandLegacyPass());
