@@ -24,12 +24,15 @@
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
+#include "llvm/CodeGen/LiveIntervals.h"
 #include "llvm/CodeGen/MachineDominators.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineInstr.h"
 #include "llvm/CodeGen/MachineLoopInfo.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
+#include "llvm/CodeGen/RegisterClassInfo.h"
+#include "llvm/CodeGen/RegisterPressure.h"
 #include "llvm/CodeGen/MachineModuleInfo.h"
 #include "llvm/CodeGen/TargetInstrInfo.h"
 #include "llvm/CodeGen/TargetRegisterInfo.h"
@@ -52,6 +55,46 @@ class ExpandPseudos : public MachineFunctionPass {
   MachineRegisterInfo *MRI = nullptr;
 
   DenseSet<Register> RegsToClearKillFlags;
+
+  // Vector register usage, kept up to date by the sinks that update it.
+  // Vector register pressure (VR pressure set) right after each instruction.
+  DenseMap<const MachineInstr *, unsigned> VRPressure;
+  // Live interval length of each vector vreg: (Last - First) * LMUL, counted
+  // in instructions that touch a vector register, summed over the blocks.
+  DenseMap<Register, unsigned> VRegLIL;
+
+  // Per block data used to update VRPressure and VRegLIL after a sink without
+  // looking at every instruction.
+  struct BlockUsage {
+    // Index of each instruction among the non-debug instructions of the block.
+    DenseMap<const MachineInstr *, unsigned> Pos;
+    // The DEFs (first reference) and LAST USEs (last reference) of the vector
+    // registers, sorted by position.
+    struct RefEvent {
+      unsigned Pos;
+      Register Reg;
+      int W;         // LMUL of the register
+      bool IsDef;    // DEF, else LAST USE
+      bool Pressure; // counts towards the VR pressure (not for live-out LAST USEs)
+    };
+    SmallVector<RefEvent, 32> Events;
+    // NextEvent[i] = index in Events of the first event at position >= i.
+    SmallVector<unsigned, 32> NextEvent;
+    // VecPrefix[i] = number of instructions touching a vector register at
+    // positions below i.
+    SmallVector<unsigned, 32> VecPrefix;
+    // First and last position of each vector vreg.
+    DenseMap<Register, std::pair<unsigned, unsigned>> Range;
+    // Live interval length of each vector vreg in this block.
+    DenseMap<Register, unsigned> LIL;
+  };
+  DenseMap<const MachineBasicBlock *, BlockUsage> Usage;
+
+  LiveIntervals *LIS = nullptr;
+  RegisterClassInfo RegClassInfo;
+  unsigned VRSet = ~0u;
+  // False once an instruction was moved or created without updating LIS.
+  bool LISValid = false;
   // Destinations of loads created by the remat transforms; sinking skips them.
   DenseSet<Register> RematRegs;
 
@@ -82,17 +125,13 @@ public:
 
 
 private:
-  MachineInstr *FindInSameSuccToSinkTo(MachineInstr &MI, MachineBasicBlock *MBB,
-                                      bool &BreakPHIEdge,
-                                      AllSuccsCache &AllSuccessors);
-  bool SinkInSameInstruction(MachineInstr &MI, bool &SawStore,
-                       AllSuccsCache &AllSuccessors);
-  bool SinkInSameInstructionGroup(
-    SmallVectorImpl<MachineInstr *> &InstrsToSink, bool &SawStore,
-    AllSuccsCache &AllSuccessors);
   bool FindFirstUseToSinkTo(MachineInstr &MI, AllSuccsCache &AllSuccessors);
   bool FindFirstUseToSinkToGroup(
     SmallVectorImpl<MachineInstr *> &InstrsToSink, AllSuccsCache &AllSuccessors);
+  void computeVectorRegUsage(MachineFunction &MF, LiveIntervals &LIS);
+  void computeBlockUsage(MachineBasicBlock &MBB);
+  void computeBlockPressure(MachineBasicBlock &MBB,
+                            DenseMap<const MachineInstr *, unsigned> &Out);
   bool ProcessRedundantReload(MachineFunction &MF);
   bool ProcessRematLoads(MachineFunction &MF);
   void ProcessInSameBlock(MachineFunction &MF);

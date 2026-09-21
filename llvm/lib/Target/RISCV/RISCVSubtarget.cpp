@@ -69,6 +69,12 @@ static cl::opt<unsigned> RISCVMaxBuildIntsCost(
     cl::desc("The maximum cost used for building integers."), cl::init(0),
     cl::Hidden);
 
+static cl::opt<unsigned> RVVFixedLengthVectorLMULMax(
+    "riscv-v-fixed-length-vector-lmul-max", cl::init(8), cl::Hidden,
+    cl::desc("The maximum LMUL (1, 2, 4 or 8) to use for fixed length "
+             "vectors. Larger fixed length vectors are split. Fractional "
+             "LMUL values are not supported."));
+
 static cl::opt<bool> UseAA("riscv-use-aa", cl::init(true),
                            cl::desc("Enable the use of AA during codegen."));
 
@@ -255,7 +261,11 @@ unsigned RISCVSubtarget::getMinRVVVectorSizeInBits() const {
 unsigned RISCVSubtarget::getMaxLMULForFixedLengthVectors() const {
   assert(hasVInstructions() &&
          "Tried to get vector length without Zve or V extension support!");
-  return 8;
+  unsigned LMULMax = RVVFixedLengthVectorLMULMax;
+  if (LMULMax != 1 && LMULMax != 2 && LMULMax != 4 && LMULMax != 8)
+    report_fatal_error("riscv-v-fixed-length-vector-lmul-max must be one of "
+                       "1, 2, 4 or 8");
+  return LMULMax;
 }
 
 bool RISCVSubtarget::useRVVForFixedLengthVectors() const {
