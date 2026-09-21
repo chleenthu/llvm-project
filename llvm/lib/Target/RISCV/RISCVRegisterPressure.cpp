@@ -10,7 +10,7 @@
 
 using namespace llvm;
 
-#define DEBUG_TYPE "riscv-register-pressure"
+#define DEBUG_TYPE "registerpressure"
 #define RISCV_INSERT_VSETVLI_NAME "Custom RISCV-V Register Pressure pass"
 
 namespace {
@@ -24,16 +24,17 @@ struct RegisterPressureHotSpot {
   bool IsClosed() { return BeginIsClosed() && EndIsClosed(); }
   void Init() {BeginClosed = EndClosed = false;}
 };
-static cl::opt<bool> EnableRegisterPressureOpt("riscv-enable-register-pressure-opt",                                                                                                                               
-                                              cl::init(true), cl::Hidden);
+
+static cl::opt<bool>
+    EnableRegisterPressureOpt("custom-pressure",
+        cl::init(true), cl::Hidden,
+        cl::desc("Measure vector register pressure of loop blocks and sink "
+                 "loads out of pressure hot spots"));
 
 // Only blocks with more than this many instructions are measured.
 static constexpr unsigned MinBlockInstrs = 20;
 
 class RISCVRegisterPressure : public MachineFunctionPass {
-  const TargetInstrInfo *TII;
-  MachineRegisterInfo *MRI;
-
 public:
   static char ID;
 
@@ -163,7 +164,7 @@ bool RISCVRegisterPressure::isVLoad(const MachineInstr &MI) {
 }
 // Print "VR=<n> (GPR=<m>)", where GPR is the GPRAll pressure set. VMV0 is a subset of VR and is left out.
 static void printVRAndGPRPressure(ArrayRef<unsigned> Pressure,
-                                  const TargetRegisterInfo *TRI) {
+                                  const TargetRegisterInfo *TRI, bool showExplicit=false) {
   unsigned VR = 0, GPR = 0;
   for (unsigned i = 0, e = Pressure.size(); i != e; ++i) {
     StringRef Name = TRI->getRegPressureSetName(i);
@@ -172,14 +173,35 @@ static void printVRAndGPRPressure(ArrayRef<unsigned> Pressure,
     else if (Name == "GPRAll")
       GPR = Pressure[i];
   }
-  dbgs() << "VR=" << VR << " (GPR=" << GPR << ")\n";
+  if (!showExplicit)
+    LLVM_DEBUG(dbgs() << "VR=" << VR << "\n");//" (GPR=" << GPR << ")\n");
+  else
+    dbgs() << "VR=" << VR << "\n";//" (GPR=" << GPR << ")\n";
+}
+
+static std::pair<unsigned, unsigned>
+getVRAndGPRPressure(ArrayRef<unsigned> Pressure, const TargetRegisterInfo *TRI) {
+  unsigned VR = 0, GPR = 0;
+  for (unsigned i = 0, e = Pressure.size(); i != e; ++i) {
+    StringRef Name = TRI->getRegPressureSetName(i);
+    if (Name == "VR")
+      VR = Pressure[i];
+    else if (Name == "GPRAll")
+      GPR = Pressure[i];
+  }
+  return {VR, GPR};
 }
 
 // Sum of live interval lengths (SLIL) of the vector virtual registers used in
-// the block. Length is counted in instructions that touch a vector register,
-// from the first to the last instruction referencing the register, inclusive.
+// the block. The last use of a register does not count towards register
+// pressure, so the length of a register is (Last - First) * LMUL, where First
+// and Last are the first and last instruction referencing it, counted in
+// instructions that touch a vector register. For
+//   def A; def B; C = A * 2
+// the length of A is 2 * LMUL.
 static unsigned computeSLIL(const MachineBasicBlock &MBB,
-                            const MachineRegisterInfo &MRI) {
+                            const MachineRegisterInfo &MRI,
+                            const TargetRegisterInfo &TRI) {
   auto IsVector = [&](Register R) {
     if (R.isVirtual())
       return RISCVRI::isVRegClass(MRI.getRegClass(R)->TSFlags);
@@ -204,8 +226,11 @@ static unsigned computeSLIL(const MachineBasicBlock &MBB,
       ++Row;
   }
   unsigned Sum = 0;
-  for (auto &KV : Range)
-    Sum += KV.second.second - KV.second.first + 1;
+  for (auto &KV : Range) {
+    unsigned LMUL =
+        TRI.getRegClassWeight(MRI.getRegClass(KV.first)).RegWeight;
+    Sum += (KV.second.second - KV.second.first) * LMUL;
+  }
   return Sum;
 }
 
@@ -217,7 +242,7 @@ bool RISCVRegisterPressure::hasHotSpotInLoop(MachineFunction &MF, MachineLoop *M
           return !MI.isDebugInstr();
         }) <= MinBlockInstrs)
       continue;
-    B->dump();
+    //B->dump();
     // RegionPressure or IntervalPressure (need LIS)
     //RegionPressure Pressure;
     IntervalPressure Pressure;
@@ -226,30 +251,28 @@ bool RISCVRegisterPressure::hasHotSpotInLoop(MachineFunction &MF, MachineLoop *M
     RegClassInfo.runOnMachineFunction(MF);
     RPTracker.init(&MF, &RegClassInfo, LIS, B, B->begin(),false, false);
     while (RPTracker.getPos() != B->end()) {
-      LLVM_DEBUG(dbgs() << "===== Pressure At a MI =====\n");
       auto MBI = RPTracker.getPos();
       auto MII = MBI.getInstrIterator();
 
-      dbgs() << "====================================================\n";
-      dbgs() << *MII;
+      LLVM_DEBUG(dbgs() << "====================================================\n");
+      LLVM_DEBUG(dbgs() << *MII);
       //if (!MII.isEnd())
-      if (MBI != B->begin()) {
-        auto PMBI = prev_nodbg(MBI, B->begin());
-        auto PMII = PMBI.getInstrIterator();
-        LLVM_DEBUG(dbgs() << "RP: prev MI " << *PMII << "\n");
-      }
-	    LLVM_DEBUG(dbgs() << "RP: cur MI " << *MII << "\n");
+      //if (MBI != B->begin()) {
+      //  auto PMBI = prev_nodbg(MBI, B->begin());
+      //  auto PMII = PMBI.getInstrIterator();
+      //  LLVM_DEBUG(dbgs() << "RP: prev MI " << *PMII << "\n");
+      //}
+      //LLVM_DEBUG(dbgs() << "RP: cur MI " << *MII << "\n");
       auto PSet = RPTracker.getRegSetPressureAtPos();
-      
       if (!P.BeginIsClosed() && PSet[14] > 32) {
         P.BeginPos = prev_nodbg(MBI, B->begin());;
         P.BeginClosed = true;
-        LLVM_DEBUG(dbgs() << "RP: P.BeginClosed set " << *P.BeginPos.getInstrIterator() << "\n");
+        //LLVM_DEBUG(dbgs() << "RP: P.BeginClosed set " << *P.BeginPos.getInstrIterator() << "\n");
       }
       if (P.BeginIsClosed() && !P.EndIsClosed() && PSet[14] <= 32) {
         P.EndPos = MBI;
         P.EndClosed = true;
-        LLVM_DEBUG(dbgs() << "RP: P.EndClosed set " << *P.EndPos.getInstrIterator() << "\n");
+        //LLVM_DEBUG(dbgs() << "RP: P.EndClosed set " << *P.EndPos.getInstrIterator() << "\n");
 
         // find a hot spot, so return
 
@@ -259,25 +282,24 @@ bool RISCVRegisterPressure::hasHotSpotInLoop(MachineFunction &MF, MachineLoop *M
 
       RPTracker.advance();
       // Pressure after the instruction printed above.
-      dbgs() << "Curr Pressure: ";
+      LLVM_DEBUG(dbgs() << "Curr Pressure: ");
       //dumpRegSetPressure(RPTracker.getRegSetPressureAtPos(),
       //                   MF.getSubtarget().getRegisterInfo());
       printVRAndGPRPressure(RPTracker.getRegSetPressureAtPos(),
                             MF.getSubtarget().getRegisterInfo());
-      LLVM_DEBUG(dbgs() << "============================\n");
     }
 
     RPTracker.closeBottom();
-    dbgs() << "====================================================\n";
-    dbgs() << "end of block\n";
+    LLVM_DEBUG(dbgs() << "====================================================\n");
+    LLVM_DEBUG(dbgs() << "end of block\n");
     // RPTracker.dump() also prints Live In / Live Out, so print only Max.
     //RPTracker.dump();
-    dbgs() << "PRP: ";
+    LLVM_DEBUG(dbgs() << "PRP: ");
     //dumpRegSetPressure(Pressure.MaxSetPressure,
     //                   MF.getSubtarget().getRegisterInfo());
     printVRAndGPRPressure(Pressure.MaxSetPressure,
                           MF.getSubtarget().getRegisterInfo());
-    dbgs() << "SLIL: " << computeSLIL(*B, MF.getRegInfo()) << "\n";
+    LLVM_DEBUG(dbgs() << "SLIL: " << computeSLIL(*B, MF.getRegInfo(), *MF.getSubtarget().getRegisterInfo()) << "\n");
     //LLVM_DEBUG(dbgs() << "isTopClosed:" << RPTracker.isTopClosed() << "\n");
     //LLVM_DEBUG(dbgs() << "isBottomClosed:" << RPTracker.isBottomClosed() << "\n");
     //RPTracker.closeRegion();
@@ -360,11 +382,11 @@ bool RISCVRegisterPressure::trySinkLoad(MachineFunction &MF, RegisterPressureHot
         // USE
         // ...
         // USE  < - MII
-        const RISCVSubtarget &ST = MF.getSubtarget<RISCVSubtarget>();                                                                                                                                         
+        const RISCVSubtarget &ST = MF.getSubtarget<RISCVSubtarget>();
         const RISCVInstrInfo *TII = ST.getInstrInfo();
         auto Opcode = MLI->getOpcode();
         DebugLoc DL;
-        for (int i = 0; i < MLI->getNumOperands(); i++) {
+        for (unsigned i = 0; i < MLI->getNumOperands(); i++) {
           LLVM_DEBUG(dbgs() << "RP: operand: " << i << " " << MLI->getOperand(i) << "\n");
         }
         LLVM_DEBUG(dbgs() << "RP: do reload\n");
@@ -390,7 +412,6 @@ bool RISCVRegisterPressure::trySinkLoad(MachineFunction &MF, RegisterPressureHot
         // LIS->repairIntervalsInRange(MB, MB->begin(), MB->end(), UsedRegs);
         //LIS->releaseMemory();
         //LIS->runOnMachineFunction(MF);
-        
         return true;
       } else {
         prevIsVLoad = false;
@@ -429,18 +450,21 @@ bool RISCVRegisterPressure::trySinkLoad(MachineFunction &MF, RegisterPressureHot
 bool RISCVRegisterPressure::runOnMachineFunction(MachineFunction &MF) {
   if (!enableRegisterPressureOpt())
     return false;
-  LLVM_DEBUG(dbgs() << "RP:Entering RegisterPressure for " << MF.getName() << "\n");
+  //LLVM_DEBUG(dbgs() << "RP:Entering RegisterPressure for " << MF.getName() << "\n");
   MLI = &getAnalysis<MachineLoopInfoWrapperPass>().getLI();
   LIS = &getAnalysis<LiveIntervalsWrapperPass>().getLIS();
   const TargetRegisterInfo *TRI = MF.getSubtarget().getRegisterInfo();
+
+  // Once per function, before any loop handling or early return.
+  //reportFunctionPressure(MF, LIS);
 
   bool change = false;
   if (MLI->empty()) {
     return false;
   }
   for (auto  ML : *MLI) {		// for all loop in function
-    auto LoopID = getLoopID(ML);  
-    auto IsVectorized = getOptionalBoolLoopAttribute(LoopID, "llvm.loop.isvectorized");
+    //auto LoopID = getLoopID(ML);  
+    //auto IsVectorized = getOptionalBoolLoopAttribute(LoopID, "llvm.loop.isvectorized");
 
     // dbgs() << "getNumRegPressureSets" << TRI->getNumRegPressureSets() << '\n';
     // for (unsigned i = 0, e = TRI->getNumRegPressureSets(); i < e; ++i) {
@@ -535,9 +559,8 @@ bool RISCVRegisterPressure::runOnMachineFunction(MachineFunction &MF) {
       changed |= trySinkLoad(MF, P, LiveVRegs, LiveVRegs[maxID]);
       change |= changed;
     }
-    
   }
-  LLVM_DEBUG(dbgs() << "Exist RegisterPressure for " << MF.getName() << "\n");
+  //LLVM_DEBUG(dbgs() << "Exist RegisterPressure for " << MF.getName() << "\n");
   return change;
 }
 

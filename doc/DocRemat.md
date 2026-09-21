@@ -72,24 +72,6 @@ When these hold, the pass:
 - rewrites the later uses to the new register and clears their kill flags,
 - erases the masked load.
 
-## Helper: `isWholeRegLoadName`
-
-Whole register loads are matched by name so the pattern is not tied to one opcode: `VL1RE8_V`, `VL2RE16_V`, `VL4RE32_V`, `VL8RE64_V`, and so on.  Names such as `PseudoVLE32_V_M4` and `VLE32_V` do not match.
-
-## Limitations
-
-- The new load stays at the position of the masked load.  It is not sunk next to its first use.  The sink path in `ProcessInSameBlock` can move it later, but it matches by name and offset patterns.
-- The `$v0 = COPY` that fed the removed masked load becomes dead when another `$v0` copy follows.  It is left for MachineDCE.
-- Verified only on the MIR after `-run-pass=expandpseudos`.  Final assembly and tests have not been checked.
-
-## Usage
-
-```text
-llc -mtriple=riscv64 -mattr=+v -custom-remat -run-pass=expandpseudos s279.mir -o -
-```
-
-`--custom-remat` can be combined with `--custom-sink`.  The remat transforms run first.
-
 # Load Rematerialization
 
 `ExpandPseudos::ProcessRematLoads` is the second transform of `--custom-remat`.  It reloads a whole register load, or recomputes a cheap ALU op (see below), right before a use that is far from the previous uses, so the register group is free in between.  RA's own remat cannot do this: loads from memory that is stored to are not trivially rematerializable.

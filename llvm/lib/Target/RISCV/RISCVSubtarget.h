@@ -394,6 +394,7 @@ public:
   unsigned getMispredictionPenalty() const override;
   unsigned getLoadLatency() const override;
 
+  unsigned getMaxLMULForFixedLengthVectors() const;
   bool useRVVForFixedLengthVectors() const;
 
   bool enableSubRegLiveness() const override;

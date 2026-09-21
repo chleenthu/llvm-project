@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "ExpandPseudos.h"
+#include <climits>
 #include "RISCV.h"
 #include "RISCVSubtarget.h"
 #include "llvm/IR/Function.h"
@@ -50,10 +51,52 @@ ExpandPseudos::ExpandPseudos() : MachineFunctionPass(ID) {
 
 void ExpandPseudos::getAnalysisUsage(AnalysisUsage &AU) const {
   AU.setPreservesCFG();
+  AU.addRequired<LiveIntervalsWrapperPass>();
   //AU.addRequired<MachineDominatorTreeWrapperPass>();
   //AU.addRequired<MachineCycleInfoWrapperPass>();
   //AU.setPreservesAll();
   MachineFunctionPass::getAnalysisUsage(AU);
+}
+
+static bool isVectorReg(Register R, const MachineRegisterInfo &MRI) {
+  if (R.isVirtual())
+    return RISCVRI::isVRegClass(MRI.getRegClass(R)->TSFlags);
+  return R.isPhysical() && RISCV::VRRegClass.contains(R);
+}
+
+// Sum of live interval lengths (SLIL) of the vector virtual registers used in
+// the block, copied from RISCVRegisterPressure.cpp. The last use of a register
+// does not count towards register pressure, so the length of a register is
+// (Last - First) * LMUL, where First and Last are the first and last
+// instruction referencing it, counted in instructions that touch a vector
+// register. Used to check the incremental update of the lengths.
+static unsigned computeSLIL(const MachineBasicBlock &MBB,
+                            const MachineRegisterInfo &MRI,
+                            const TargetRegisterInfo &TRI) {
+  DenseMap<Register, std::pair<unsigned, unsigned>> Range;
+  unsigned Row = 0;
+  for (const MachineInstr &MI : MBB) {
+    if (MI.isDebugInstr())
+      continue;
+    bool Touches = false;
+    for (const MachineOperand &MO : MI.operands()) {
+      if (!MO.isReg() || !MO.getReg() || !isVectorReg(MO.getReg(), MRI))
+        continue;
+      Touches = true;
+      if (MO.getReg().isVirtual()) {
+        auto It = Range.try_emplace(MO.getReg(), Row, Row).first;
+        It->second.second = Row;
+      }
+    }
+    if (Touches)
+      ++Row;
+  }
+  unsigned Sum = 0;
+  for (auto &KV : Range) {
+    unsigned LMUL = TRI.getRegClassWeight(MRI.getRegClass(KV.first)).RegWeight;
+    Sum += (KV.second.second - KV.second.first) * LMUL;
+  }
+  return Sum;
 }
 
 // Matches whole register loads named VL<NF>RE<EEW>_V, e.g. VL4RE32_V.
@@ -198,6 +241,36 @@ bool ExpandPseudos::LowerCopy(MachineBasicBlock &MBB, MachineInstr &MI) {
   return MadeChange;
 }
 
+// Locate the first non-debug use of Reg after Def in Def's block. The uses come
+// from the register's use list, so the walk only tests set membership instead
+// of scanning the operands of every instruction. Returns null if some use is in
+// another block, or there is none. Between, if given, is the number of
+// non-debug instructions between Def and the first use.
+static MachineInstr *findFirstUseInBlock(MachineInstr &Def, Register Reg,
+                                         MachineRegisterInfo &MRI,
+                                         unsigned *Between = nullptr) {
+  MachineBasicBlock *MBB = Def.getParent();
+  SmallPtrSet<const MachineInstr *, 8> Uses;
+  for (MachineInstr &U : MRI.use_nodbg_instructions(Reg)) {
+    if (U.getParent() != MBB)
+      return nullptr;
+    if (&U != &Def)
+      Uses.insert(&U);
+  }
+  unsigned Count = 0;
+  for (auto It = std::next(Def.getIterator()); It != MBB->end(); ++It) {
+    if (It->isDebugInstr())
+      continue;
+    if (Uses.count(&*It)) {
+      if (Between)
+        *Between = Count;
+      return &*It;
+    }
+    ++Count;
+  }
+  return nullptr;
+}
+
 // Sink MI down to just before the first use of its result:
 //   def A
 //   ...
@@ -219,20 +292,8 @@ bool ExpandPseudos::FindFirstUseToSinkTo(
 
   // Find the first use in this block. Uses elsewhere keep the value live past
   // the block, so leave those alone.
-  MachineInstr *FirstUse = nullptr;
-  for (MachineInstr &U : MRI->use_nodbg_instructions(Reg))
-    if (U.getParent() != MBB)
-      return false;
-  for (auto It = std::next(MI.getIterator()); It != MBB->end(); ++It) {
-    if (It->isDebugInstr())
-      continue;
-    if (any_of(It->operands(), [&](const MachineOperand &MO) {
-          return MO.isReg() && MO.isUse() && MO.getReg() == Reg;
-        })) {
-      FirstUse = &*It;
-      break;
-    }
-  }
+  unsigned N = 0;
+  MachineInstr *FirstUse = findFirstUseInBlock(MI, Reg, *MRI, &N);
   if (!FirstUse || &*std::next(MI.getIterator()) == FirstUse) {
     LLVM_DEBUG(dbgs() << "  No first use, or already just before it.\n");
     return false;
@@ -266,9 +327,163 @@ bool ExpandPseudos::FindFirstUseToSinkTo(
   }
 
   LLVM_DEBUG(dbgs() << "  Sink " << MI << "  before " << *FirstUse);
+  LLVM_DEBUG(dbgs() << "  Between: " << N << "\n");
+
+  // Predict the effect on the vector register pressure and live interval
+  // lengths. Sinking MI moves its DEF (and its LAST USEs) N instructions
+  // later, so:
+  //  - the N instructions it passes lose MI's net change (+DEF, -LAST USE),
+  //  - MI's own point gains the net change of the N instructions passed,
+  //    which are the DEFs and LAST USEs found among the events in the window,
+  //  - the registers of MI: a first reference moves N instructions later (the
+  //    interval gets shorter), a last reference moves later (longer).
+  BlockUsage &BU = Usage[MBB];
+  unsigned P = BU.Pos.lookup(&MI);
+  unsigned Rows = BU.VecPrefix[P + N + 1] - BU.VecPrefix[P + 1];
+  auto Weight = [&](Register R) {
+    return (int)TRI->getRegClassWeight(MRI->getRegClass(R)).RegWeight;
+  };
+
+  // What every instruction MI passes gains in RP: MI's DEFs are not live yet
+  // (-LMUL each) and the registers of its LAST USEs are still live (+LMUL each).
+  int DeltaMI = 0;
+  for (unsigned I = BU.NextEvent[P];
+       I < BU.Events.size() && BU.Events[I].Pos == P; ++I)
+    if (BU.Events[I].Pressure)
+      DeltaMI += BU.Events[I].IsDef ? -BU.Events[I].W : BU.Events[I].W; // update passby RP
+
+  // LIL is counted in rows (instructions touching a vector register) and MI is
+  // one row. The registers of MI: a first reference moves Rows later (shorter
+  // by Rows * LMUL), a last reference moves Rows later (longer).
+  DenseMap<Register, int> LILChange;
+  SmallSet<Register, 4> Seen; // a register can be an operand more than once
+  for (const MachineOperand &MO : MI.operands()) {
+    if (!MO.isReg() || !MO.getReg().isVirtual() ||
+        !isVectorReg(MO.getReg(), *MRI) || !Seen.insert(MO.getReg()).second)
+      continue;
+    Register R = MO.getReg();
+    auto Range = BU.Range.lookup(R);
+    if (Range.first == P)
+      LILChange[R] -= (int)Rows * Weight(R); // update sunk LIL
+    if (Range.second == P)
+      LILChange[R] += (int)Rows * Weight(R);
+  }
+
+  // One walk over the DEFs and LAST USEs in (P, P + N], starting at the first
+  // event after MI and visiting no other instruction. Each one updates both:
+  //  - RP: MI's point gains a DEF and loses a LAST USE it passes,
+  //  - LIL: MI is one row that moves from before to after the window.
+  //    A DEF whose register is used after the window now has MI between its
+  //    first and last reference (+LMUL). A LAST USE whose register was first
+  //    referenced before MI no longer has MI between them (-LMUL).
+  // A register MI reads whose last use is in the window is now last used by
+  // MI, so it stays live through the rest of the window: its LIL grows by the
+  // rows after that last use and the RP of those instructions by its LMUL.
+  SmallSet<Register, 4> MIUses;
+  for (const MachineOperand &MO : MI.operands())
+    if (MO.isReg() && MO.isUse() && !MO.isUndef() && MO.getReg().isVirtual() &&
+        isVectorReg(MO.getReg(), *MRI))
+      MIUses.insert(MO.getReg());
+  SmallVector<std::pair<unsigned, int>, 4> Extend; // (position, LMUL)
+  int WindowNet = 0;
+  unsigned NumEvents = 0;
+  for (unsigned I = BU.NextEvent[P + 1];
+       I < BU.Events.size() && BU.Events[I].Pos <= P + N; ++I) {
+    const BlockUsage::RefEvent &E = BU.Events[I];
+    ++NumEvents;
+    if (E.Pressure)
+      WindowNet += E.IsDef ? E.W : -E.W; // update sunk RP
+    if (E.Reg.isVirtual()) {
+      auto Range = BU.Range.lookup(E.Reg);
+      if (E.IsDef && Range.second > P + N) // R's last use is after the window
+        LILChange[E.Reg] += E.W; // update passby LIL
+      if (!E.IsDef && MIUses.count(E.Reg)) {
+        LILChange[E.Reg] += // update passby LIL, sunk is not last use but becomes last use after sink
+            E.W * (int)(BU.VecPrefix[P + N + 1] - BU.VecPrefix[E.Pos + 1]);
+        Extend.push_back({E.Pos, E.W});
+      } else if (!E.IsDef && Range.first < P) { // R's first reference is before MI
+        LILChange[E.Reg] -= E.W;
+      }
+    }
+    LLVM_DEBUG(dbgs() << "    " << (E.IsDef ? "DEF" : "LAST USE") << " of "
+                      << printReg(E.Reg, TRI) << " at +" << E.Pos - P
+                      << ", LMUL " << E.W << "\n");
+  }
+  int LILDelta = 0;
+  unsigned LILBefore = 0;
+  for (auto &KV : BU.LIL)
+    LILBefore += KV.second;
+  for (auto &KV : LILChange)
+    LILDelta += KV.second;
+  LLVM_DEBUG(dbgs() << "  RP: passed instructions " << DeltaMI
+                    << " each, MI point " << WindowNet << " from " << NumEvents
+                    << " events\n");
+
   MBB->splice(FirstUse->getIterator(), MBB, MI.getIterator());
+  if (LISValid)
+    LIS->handleMove(MI);
   for (MachineOperand &MO : MI.all_uses())
     RegsToClearKillFlags.insert(MO.getReg());
+
+  // Apply the prediction. The N passed instructions are now just before MI.
+  unsigned OldRP = VRPressure.lookup(&MI);
+  auto Passed = MI.getIterator();
+  for (unsigned i = 0; i < N;) {
+    --Passed;
+    if (Passed->isDebugInstr())
+      continue;
+    unsigned Q = P + N - i; // position it had before the move
+    VRPressure[&*Passed] += DeltaMI;
+    for (auto &X : Extend)
+      if (X.first <= Q)
+        VRPressure[&*Passed] += X.second; // update passby RP, sunk is not last use but becomes last use after sink
+    ++i;
+  }
+  VRPressure[&MI] += WindowNet;
+  LLVM_DEBUG(dbgs() << "  RP of MI: " << OldRP << " -> " << VRPressure[&MI]
+                    << "\n");
+  DenseMap<Register, unsigned> PredictedLIL;
+  for (auto &E : LILChange)
+    PredictedLIL[E.first] = BU.LIL.lookup(E.first) + E.second;
+  unsigned PredictedSLIL = LILBefore + LILDelta;
+
+  computeBlockUsage(*MBB);
+
+  // Verify against a fresh RegPressureTracker run and the recomputed lengths.
+  LLVM_DEBUG({
+    if (LISValid) {
+      DenseMap<const MachineInstr *, unsigned> Fresh;
+      computeBlockPressure(*MBB, Fresh);
+      unsigned Bad = 0;
+      for (MachineInstr &I : *MBB) {
+        if (I.isDebugInstr())
+          continue;
+        if (Fresh.lookup(&I) != VRPressure.lookup(&I)) {
+          dbgs() << "  RP MISMATCH at " << I << "    predicted "
+                 << VRPressure.lookup(&I) << ", RPTracker " << Fresh.lookup(&I)
+                 << "\n";
+          ++Bad;
+        }
+      }
+      if (!Bad)
+        dbgs() << "  RP verified against RPTracker: OK\n";
+      for (auto &KV : Fresh)
+        VRPressure[KV.first] = KV.second;
+    } else {
+      dbgs() << "  RP verification skipped: LiveIntervals are stale\n";
+    }
+    for (auto &E : PredictedLIL) {
+      unsigned Now = Usage[MBB].LIL.lookup(E.first);
+      dbgs() << "  LIL of " << printReg(E.first, TRI) << ": "
+             << (int)E.second - LILChange[E.first] << " -> predicted "
+             << E.second << ", recomputed " << Now
+             << (Now == E.second ? "  OK\n" : "  MISMATCH\n");
+    }
+    unsigned SLILNow = computeSLIL(*MBB, *MRI, *TRI);
+    dbgs() << "  SLIL: " << LILBefore << " -> predicted " << PredictedSLIL
+           << ", computeSLIL " << SLILNow
+           << (SLILNow == PredictedSLIL ? "  OK\n" : "  MISMATCH\n");
+  });
   return true;
 }
 
@@ -279,7 +494,8 @@ bool ExpandPseudos::FindFirstUseToSinkTo(
 //   C = A * 2
 bool ExpandPseudos::FindFirstUseToSinkToGroup(
     SmallVectorImpl<MachineInstr *> &InstrsToSink, AllSuccsCache &AllSuccessors) {
-  LLVM_DEBUG(dbgs() << "  FindFirstUseToSinkToGroup.\n");
+  LLVM_DEBUG(dbgs() << "  FindFirstUseToSinkToGroup with "
+                    << InstrsToSink.size() << " instructions.\n");
   if (InstrsToSink.empty())
     return false;
   MachineInstr &Primary = *InstrsToSink[0];
@@ -289,26 +505,13 @@ bool ExpandPseudos::FindFirstUseToSinkToGroup(
       return false;
   Register Reg = Primary.getOperand(0).getReg();
 
-  // Find the first use and count the instructions between it and the load.
-  MachineInstr *FirstUse = nullptr;
   unsigned Between = 0;
-  for (auto It = std::next(Primary.getIterator()); It != MBB->end(); ++It) {
-    if (It->isDebugInstr())
-      continue;
-    if (any_of(It->operands(), [&](const MachineOperand &MO) {
-          return MO.isReg() && MO.isUse() && MO.getReg() == Reg;
-        })) {
-      FirstUse = &*It;
-      break;
-    }
-    ++Between;
-  }
+  MachineInstr *FirstUse = findFirstUseInBlock(Primary, Reg, *MRI, &Between);
   if (!FirstUse) {
     LLVM_DEBUG(dbgs() << "  First use not found.\n");
     return false;
   }
 
-  // Insert before the instruction right preceding the first use.
   MachineBasicBlock::iterator Target = FirstUse->getIterator();
   do {
     --Target;
@@ -320,7 +523,6 @@ bool ExpandPseudos::FindFirstUseToSinkToGroup(
     LLVM_DEBUG(dbgs()<<"  Between: "<<Between<<"\n");
   }
 
-  // Already within 2 units of the insertion point: nothing to gain.
   unsigned Dist = 0;
   for (auto It = std::next(Primary.getIterator()); It != MBB->end(); ++It) {
     if (It->isDebugInstr())
@@ -331,19 +533,6 @@ bool ExpandPseudos::FindFirstUseToSinkToGroup(
   }
   LLVM_DEBUG(dbgs() << "  Sink before: " << *Target);
 
-  // Collect the group in block order so dependencies stay ordered.
-  SmallPtrSet<MachineInstr *, 4> InGroup(InstrsToSink.begin(),
-                                         InstrsToSink.end());
-  SmallVector<MachineInstr *, 4> Ordered;
-  for (MachineInstr &MI : *MBB) {
-    if (InGroup.count(&MI))
-      Ordered.push_back(&MI);
-    if (&MI == &Primary)
-      break;
-  }
-  if (Ordered.size() != InGroup.size())
-    return false;
-
   auto Overlaps = [&](Register A, Register B) {
     if (A == B)
       return true;
@@ -351,10 +540,10 @@ bool ExpandPseudos::FindFirstUseToSinkToGroup(
   };
 
   // Check that nothing crossed conflicts with the moved instructions.
-  for (MachineInstr *M : Ordered) {
+  for (MachineInstr *M : InstrsToSink) {
     for (auto It = std::next(M->getIterator()); It != Target; ++It) {
       MachineInstr &I = *It;
-      if (I.isDebugInstr() || InGroup.count(&I))
+      if (I.isDebugInstr())
         continue;
       if (I.isCall() || I.hasUnmodeledSideEffects())
         return false;
@@ -377,205 +566,21 @@ bool ExpandPseudos::FindFirstUseToSinkToGroup(
       }
     }
   }
-
-  LLVM_DEBUG(dbgs() << "  Sinking group of instructions\n");
-  for (MachineInstr *M : Ordered) {
-    LLVM_DEBUG(dbgs() << "  " << *M);
-    MBB->splice(Target, MBB, M->getIterator());
-    for (MachineOperand &MO : M->all_uses())
-      RegsToClearKillFlags.insert(MO.getReg());
-  }
-  return true;
-}
-
-MachineInstr *
-ExpandPseudos::FindInSameSuccToSinkTo(MachineInstr &MI, MachineBasicBlock *MBB,
-                                 bool &BreakPHIEdge,
-                                 AllSuccsCache &AllSuccessors) {
-  LLVM_DEBUG(dbgs()<<"  FindInSameSuccToSinkTo.\n");
-  assert(MBB && "Invalid MachineBasicBlock!");
-
-  MachineInstr *SuccToSinkTo = nullptr;
-  const MachineOperand &MO = MI.getOperand(0);
-  Register Reg = MO.getReg();
-  LLVM_DEBUG(dbgs()<<"  Dest: "<<MO<<"\n");
-  //LLVM_DEBUG(dbgs()<<"UseMI:\n");
-  bool AfterMI = false;
-  for (MachineInstr &UseMI : *MBB) {
-    if (&UseMI == &MI) {
-      AfterMI = true;
-      continue;
-    }
-    if (!AfterMI) {
-      continue;
-    }
-    //LLVM_DEBUG(dbgs()<<"  "<<UseMI);
-    if (UseMI.getNumOperands() > 0) {
-      const MachineOperand &UseOp = UseMI.getOperand(0);
-      if (UseOp.isReg() && UseOp.getReg() == Reg) {
-        if (UseMI.getOpcode() == RISCV::PseudoVLE32_V_M8_MASK) {
-          LLVM_DEBUG(dbgs()<<"  UseMI: "<<UseMI);
-          SuccToSinkTo = &UseMI;
-          break;
-        }
-      }
-    }
-    if (UseMI.getOpcode() == RISCV::PseudoVFADD_VV_M8_E32) {
-      for (unsigned i = 0; i < UseMI.getNumOperands(); i++) {
-        const MachineOperand &UseOp = UseMI.getOperand(i);
-        if (UseOp.isReg() && UseOp.getReg() == Reg) {
-          LLVM_DEBUG(dbgs()<<"  UseMI: "<<UseMI);
-          LLVM_DEBUG(dbgs() << "  "<<UseOp<<" is used as operand " << i << "\n");
-          SuccToSinkTo = &UseMI;
-          return SuccToSinkTo;
-        }
-      }
-    }
-    if (UseMI.getOpcode() == RISCV::PseudoVFMAX_VV_M8_E32) {
-      for (unsigned i = 0; i < UseMI.getNumOperands(); i++) {
-        const MachineOperand &UseOp = UseMI.getOperand(i);
-        if (UseOp.isReg() && UseOp.getReg() == Reg) {
-          LLVM_DEBUG(dbgs()<<"  UseMI: "<<UseMI);
-          LLVM_DEBUG(dbgs() << "  "<<UseOp<<" is used as operand " << i << "\n");
-          SuccToSinkTo = &UseMI;
-          return SuccToSinkTo;
-        }
-      }
-    }
-  }
-  return SuccToSinkTo;
-}
-
-bool ExpandPseudos::SinkInSameInstruction(MachineInstr &MI, bool &SawStore,
-                                     AllSuccsCache &AllSuccessors) {
-  LLVM_DEBUG(dbgs()<<"  SinkInSameInstruction.\n");
-  if (!TII->shouldSink(MI)) {
-    LLVM_DEBUG(dbgs()<<"should not sink.\n");
-    return false;
-  }
-  if (!MI.isSafeToMove(SawStore)) {
-    LLVM_DEBUG(dbgs()<<"not safe to move.\n");
-    return false;
-  }
-  if (MI.isConvergent()) {
-    LLVM_DEBUG(dbgs()<<"is convergent.\n");
-    return false;
-  }
-  bool BreakPHIEdge = false;
-  MachineBasicBlock *ParentBlock = MI.getParent();
-  MachineBasicBlock *SuccToSinkTo = MI.getParent();
-  MachineInstr *TargetUser =
-      FindInSameSuccToSinkTo(MI, ParentBlock, BreakPHIEdge, AllSuccessors);
-  if (!TargetUser)
-    return false;
-  for (const MachineOperand &MO : MI.all_defs()) {
-    Register Reg = MO.getReg();
-    if (Reg == 0 || !Reg.isPhysical())
-      continue;
-    if (SuccToSinkTo->isLiveIn(Reg))
-      return false;
-  }
-  LLVM_DEBUG(dbgs() << "  Sink instr " << MI);
-  MachineBasicBlock::iterator InsertPos = TargetUser->getIterator();
-  MachineBasicBlock::iterator CurrPos = MI.getIterator();
-  SmallVector<MIRegs, 4> DbgUsersToSink;
-  for (auto &MO : MI.all_defs()) {
-    if (!MO.getReg().isVirtual())
-      continue;
-    auto It = SeenDbgUsers.find(MO.getReg());
-    if (It == SeenDbgUsers.end())
-      continue;
-    auto &Users = It->second;
-    for (auto &User : Users) {
-      MachineInstr *DbgMI = User.getPointer();
-      if (User.getInt()) {
-        if (!attemptDebugCopyProp(MI, *DbgMI, MO.getReg()))
-          DbgMI->setDebugValueUndef();
-      } else {
-        DbgUsersToSink.push_back(
-            {DbgMI, SmallVector<Register, 2>(1, MO.getReg())});
-      }
-    }
-  }
-  //performSink(MI, *SuccToSinkTo, InsertPos, DbgUsersToSink);
-  SuccToSinkTo->splice(InsertPos, SuccToSinkTo, CurrPos);
-  for (MachineOperand &MO : MI.all_uses())
-    RegsToClearKillFlags.insert(MO.getReg());
-  return true;
-}
-
-bool ExpandPseudos::SinkInSameInstructionGroup(
-    SmallVectorImpl<MachineInstr *> &InstrsToSink, bool &SawStore,
-    AllSuccsCache &AllSuccessors) {
-  LLVM_DEBUG(dbgs() << "  SinkInSameInstructionGroup with "
-                    << InstrsToSink.size() << " instructions.\n");
-  if (InstrsToSink.empty())
-    return false;
-  MachineInstr &PrimaryMI = *InstrsToSink[0];
-  for (MachineInstr *MI : InstrsToSink) {
-    if (!TII->shouldSink(*MI)) {
-      LLVM_DEBUG(dbgs() << "should not sink: " << *MI);
-      return false;
-    }
-    if (!MI->isSafeToMove(SawStore)) {
-      LLVM_DEBUG(dbgs() << "not safe to move: " << *MI);
-      return false;
-    }
-    if (MI->isConvergent()) {
-      LLVM_DEBUG(dbgs() << "is convergent: " << *MI);
-      return false;
-    }
-  }
-  bool BreakPHIEdge = false;
-  MachineBasicBlock *ParentBlock = PrimaryMI.getParent();
-  MachineBasicBlock *SuccToSinkTo = PrimaryMI.getParent();
-  MachineInstr *TargetUser =
-      FindInSameSuccToSinkTo(PrimaryMI, ParentBlock, BreakPHIEdge, AllSuccessors);
-  if (!TargetUser)
-    return false;
-  for (MachineInstr *MI : InstrsToSink) {
-    for (const MachineOperand &MO : MI->all_defs()) {
-      Register Reg = MO.getReg();
-      if (Reg == 0 || !Reg.isPhysical())
-        continue;
-      if (SuccToSinkTo->isLiveIn(Reg))
-        return false;
-    }
-  }
   LLVM_DEBUG(dbgs() << "  Sinking group of instructions\n");
   for (MachineInstr *MI : InstrsToSink) {
     LLVM_DEBUG(dbgs() << "  " << *MI);
   }
-  MachineBasicBlock::iterator InsertPos = TargetUser->getIterator();
+  MachineBasicBlock::iterator InsertPos = Target;
   for (auto It = InstrsToSink.begin(); It != InstrsToSink.end(); ++It) {
     MachineInstr *MI = *It;
     MachineBasicBlock::iterator CurrPos = MI->getIterator();
-    SuccToSinkTo->splice(InsertPos, SuccToSinkTo, CurrPos);
+    MBB->splice(InsertPos, MBB, CurrPos);
     InsertPos = MI->getIterator();
-  }
-  SmallVector<MIRegs, 4> DbgUsersToSink;
-  for (MachineInstr *MI : InstrsToSink) {
-    for (auto &MO : MI->all_defs()) {
-      if (!MO.getReg().isVirtual())
-        continue;
-      auto It = SeenDbgUsers.find(MO.getReg());
-      if (It == SeenDbgUsers.end())
-        continue;
-      auto &Users = It->second;
-      for (auto &User : Users) {
-        MachineInstr *DbgMI = User.getPointer();
-        if (User.getInt()) {
-          if (!attemptDebugCopyProp(*MI, *DbgMI, MO.getReg()))
-            DbgMI->setDebugValueUndef();
-        } else {
-          DbgUsersToSink.push_back(
-              {DbgMI, SmallVector<Register, 2>(1, MO.getReg())});
-        }
-      }
-    }
     for (MachineOperand &MO : MI->all_uses())
       RegsToClearKillFlags.insert(MO.getReg());
   }
+  LISValid = false;
+  computeBlockUsage(*MBB);
   return true;
 }
 
@@ -589,53 +594,13 @@ void ExpandPseudos::ProcessInSameBlock(MachineFunction &MF) {
     }
   }
   LLVM_DEBUG(dbgs()<<"BlockSize: "<<BlockSize<<"\n");
-  int SinkVMVTime = 0;
-  int LoadTime256 = 0;
-  int LoadTime384 = 0;
   DenseSet<Register> SinkRegs;
   for (auto &MBB : MF) {
     LLVM_DEBUG(dbgs()<<"ProcessInSameBlock.\n");
     AllSuccsCache AllSuccessors;
-    // Sink VMV and MASK. Iterate backward so that SawStore only covers the
-    // stores after the current instruction, which are the ones a sunk
-    // instruction may cross. Sinking moves instructions later, to positions
-    // that were already visited, so walk a snapshot of the block.
-    SmallVector<MachineInstr *, 64> Snapshot;
-    for (MachineInstr &I : MBB)
-      Snapshot.push_back(&I);
-    bool SawStoreBwd = false;
-    for (MachineInstr *MIPtr : llvm::reverse(Snapshot)) {
-      MachineInstr &MI = *MIPtr;
-      const TargetInstrInfo *TII = MI.getParent()->getParent()->getSubtarget().getInstrInfo();
-      StringRef Name = TII->getName(MI.getOpcode());
-      if (Name.contains("PseudoVMV_V_I")) {
-        const MachineOperand &Dst = MI.getOperand(0);
-        const MachineOperand &MO = MI.getOperand(1);
-        ++SinkVMVTime;
-        if (SinkVMVTime <= 2 && Dst.isReg() && MO.isReg() && Dst.getReg() == MO.getReg()) {
-          LLVM_DEBUG(dbgs()<<"Prepare to sink "<<MI);
-          if (SinkInSameInstruction(MI, SawStoreBwd, AllSuccessors))
-            LLVM_DEBUG(dbgs()<<"  Sink success.\n");
-        }
-      }
-      if (Name.contains("PseudoVMSLE_VI_M")) {
-        const MachineOperand &Dst = MI.getOperand(0);
-        const MachineOperand &Src = MI.getOperand(1);
-        if (Dst.isReg() && Src.isReg()) {
-          LLVM_DEBUG(dbgs()<<"Prepare to sink "<<MI);
-          if (SinkInSameInstruction(MI, SawStoreBwd, AllSuccessors))
-            LLVM_DEBUG(dbgs()<<"  Sink success.\n");
-        }
-      }
-      // Track stores seen so far (i.e. located after later-visited
-      // instructions) for the isSafeToMove query.
-      if (MI.mayStore())
-        SawStoreBwd = true;
-    }
 
     // Sink LOAD
-    // Dont modify here. For easy stdout review I iterate forward here.
-    //LLVM_DEBUG(dbgs()<<"==================== Sink LOAD ====================\n");
+    // For easy stdout review I iterate forward here.
     bool ProcessedBegin, SawStore = false;
     for (auto It = MBB.begin(); It != MBB.end(); ){
       MachineInstr &MI = *It;
@@ -646,12 +611,15 @@ void ExpandPseudos::ProcessInSameBlock(MachineFunction &MF) {
       if (Name.contains("PseudoVMV_V_I")) {
         const MachineOperand &Dst = MI.getOperand(0);
         const MachineOperand &MO = MI.getOperand(1);
-        ++SinkVMVTime;
-        if (SinkVMVTime <= 2 && Dst.isReg() && MO.isReg() && Dst.getReg() == MO.getReg()) {
-          LLVM_DEBUG(dbgs()<<"Prepare to sink "<<MI);
-          if (SinkInSameInstruction(MI, SawStore, AllSuccessors)) {
-            LLVM_DEBUG(dbgs()<<"  Sink success.\n");
-            Sunk = true;
+        if (Dst.isReg() && MO.isReg() && Dst.getReg() == MO.getReg()) {
+          Register DstReg = Dst.getReg();
+          if (!SinkRegs.count(DstReg)) {
+            SinkRegs.insert(DstReg);
+            LLVM_DEBUG(dbgs()<<"Prepare to sink "<<MI);
+            if (FindFirstUseToSinkTo(MI, AllSuccessors)) {
+              LLVM_DEBUG(dbgs()<<"  Sink success.\n");
+              Sunk = true;
+            }
           }
         }
       }
@@ -659,10 +627,14 @@ void ExpandPseudos::ProcessInSameBlock(MachineFunction &MF) {
         const MachineOperand &Dst = MI.getOperand(0);
         const MachineOperand &Src = MI.getOperand(1);
         if (Dst.isReg() && Src.isReg()) {
-          LLVM_DEBUG(dbgs()<<"Prepare to sink "<<MI);
-          if (FindFirstUseToSinkTo(MI, AllSuccessors)) {
-            LLVM_DEBUG(dbgs()<<"  Sink success.\n");
-            Sunk = true;
+          Register DstReg = Dst.getReg();
+          if (!SinkRegs.count(DstReg)) {
+            SinkRegs.insert(DstReg);
+            LLVM_DEBUG(dbgs()<<"Prepare to sink "<<MI);
+            if (FindFirstUseToSinkTo(MI, AllSuccessors)) {
+              LLVM_DEBUG(dbgs()<<"  Sink success.\n");
+              Sunk = true;
+            }
           }
         }
       }
@@ -675,23 +647,7 @@ void ExpandPseudos::ProcessInSameBlock(MachineFunction &MF) {
               MI.memoperands_begin() != MI.memoperands_end()) {
             const MachineMemOperand *MMO = *MI.memoperands_begin();
             if (const Value *PtrVal = MMO->getValue()) {
-              /*int64_t Offset = MMO->getOffset();
               bool ShouldSink = false;
-              if (Offset >= (BlockSize / 2) * 4) {
-                LLVM_DEBUG(dbgs() << "  Matched 3rd VLE32 load: offset=" << Offset << "\n");
-                ++LoadTime256;
-                if (1 <= LoadTime256) {
-                  ShouldSink = true;
-                }
-              }
-              else if (Offset == (BlockSize / 4 * 3) * 4) {
-                LLVM_DEBUG(dbgs() << "  Matched 4th VLE32 load: offset=" << Offset << "\n");
-                ++LoadTime384;
-                if (1 <= LoadTime384) {
-                  ShouldSink = true;
-                }
-              }*/
-              bool ShouldSink = true;
               if (ShouldSink) {
                 SinkRegs.insert(DstReg);
                 LLVM_DEBUG(dbgs()<<"Prepare to sink Group "<<MI);
@@ -735,10 +691,7 @@ void ExpandPseudos::ProcessInSameBlock(MachineFunction &MF) {
                     break;
                   }
                 }
-                if (SinkInSameInstructionGroup(InstructionsToSink, SawStore, AllSuccessors)) {
-                  LLVM_DEBUG(dbgs()<<"  Sink Group success.\n");
-                  Sunk = true;
-                } else if (FindFirstUseToSinkToGroup(InstructionsToSink, AllSuccessors)) {
+                if (FindFirstUseToSinkToGroup(InstructionsToSink, AllSuccessors)) {
                   LLVM_DEBUG(dbgs()<<"  Sink Group to first use success.\n");
                   Sunk = true;
                 }
@@ -1174,13 +1127,157 @@ bool ExpandPseudos::ProcessRematLoads(MachineFunction &MF) {
   return Changed;
 }
 
+// Vector register pressure right after each instruction of MBB, tracked with
+// RegPressureTracker as RISCVRegisterPressure does. Needs valid LiveIntervals.
+void ExpandPseudos::computeBlockPressure(
+    MachineBasicBlock &MBB, DenseMap<const MachineInstr *, unsigned> &Out) {
+  if (VRSet == ~0u)
+    return;
+  IntervalPressure Pressure;
+  RegPressureTracker RPTracker(Pressure);
+  RPTracker.init(MBB.getParent(), &RegClassInfo, LIS, &MBB, MBB.begin(), false,
+                 false);
+  while (RPTracker.getPos() != MBB.end()) {
+    const MachineInstr &MI = *RPTracker.getPos();
+    RPTracker.advance();
+    Out[&MI] = RPTracker.getRegSetPressureAtPos()[VRSet];
+  }
+}
+
+// Positions, pressure events, register ranges and live interval lengths of
+// the vector registers in MBB. The last use of a register does not count
+// towards pressure, so a register is live after its first reference up to but
+// not including its last one: +LMUL at the first, -LMUL at the last.
+void ExpandPseudos::computeBlockUsage(MachineBasicBlock &MBB) {
+  BlockUsage &BU = Usage[&MBB];
+  for (auto &KV : BU.LIL)
+    VRegLIL[KV.first] -= KV.second;
+  BU = BlockUsage();
+
+  DenseMap<Register, std::pair<unsigned, bool>> FirstIsUse; // first pos, is use
+  DenseSet<Register> HasDef;
+  DenseMap<Register, unsigned> OpenPhys; // physical vector reg -> last ref
+  unsigned Pos = 0;
+  for (MachineInstr &MI : MBB) {
+    if (MI.isDebugInstr())
+      continue;
+    BU.Pos[&MI] = Pos;
+    BU.VecPrefix.push_back(BU.VecPrefix.empty() ? 0 : BU.VecPrefix.back());
+    bool Touches = false;
+    // Uses first, then defs, so a physical register redefined by the
+    // instruction that also reads it is closed after the read.
+    for (int Pass = 0; Pass < 2; ++Pass)
+      for (const MachineOperand &MO : MI.operands()) {
+        if (!MO.isReg() || !MO.getReg() || !isVectorReg(MO.getReg(), *MRI))
+          continue;
+        if (MO.isDef() != (Pass == 1))
+          continue;
+        // An undef use (the passthru tied to a def) reads nothing.
+        if (MO.isUse() && MO.isUndef())
+          continue;
+        Touches = true;
+        Register R = MO.getReg();
+        if (R.isVirtual()) {
+          auto It = BU.Range.try_emplace(R, Pos, Pos).first;
+          It->second.second = Pos;
+          FirstIsUse.try_emplace(R, Pos, MO.isUse());
+          if (MO.isDef())
+            HasDef.insert(R);
+        } else if (MO.isDef()) {
+          auto It = OpenPhys.find(R);
+          if (It != OpenPhys.end())
+            BU.Events.push_back({It->second, R, 1, false, true});
+          BU.Events.push_back({Pos, R, 1, true, true});
+          OpenPhys[R] = Pos;
+        } else {
+          auto It = OpenPhys.find(R);
+          if (It != OpenPhys.end())
+            It->second = Pos;
+        }
+      }
+    if (Touches)
+      ++BU.VecPrefix.back();
+    ++Pos;
+  }
+  for (auto &KV : OpenPhys)
+    BU.Events.push_back({KV.second, KV.first, 1, false, true});
+  BU.VecPrefix.push_back(BU.VecPrefix.empty() ? 0 : BU.VecPrefix.back());
+
+  for (auto &KV : BU.Range) {
+    Register R = KV.first;
+    unsigned W = TRI->getRegClassWeight(MRI->getRegClass(R)).RegWeight;
+    // Live out of the block if referenced in another block, or carried around
+    // a loop (first reference is a use and there is a def).
+    bool LiveOut = FirstIsUse[R].second && HasDef.count(R);
+    for (MachineInstr &U : MRI->reg_instructions(R))
+      if (U.getParent() != &MBB) {
+        LiveOut = true;
+        break;
+      }
+    BU.Events.push_back({KV.second.first, R, (int)W, true, true});
+    BU.Events.push_back({KV.second.second, R, (int)W, false, !LiveOut});
+    BU.LIL[R] = (BU.VecPrefix[KV.second.second] - BU.VecPrefix[KV.second.first]) * W;
+  }
+  llvm::stable_sort(BU.Events, [](const BlockUsage::RefEvent &A,
+                                  const BlockUsage::RefEvent &B) {
+    return A.Pos < B.Pos;
+  });
+  BU.NextEvent.assign(Pos + 1, 0);
+  for (unsigned I = 0, E = 0; I <= Pos; ++I) {
+    while (E < BU.Events.size() && BU.Events[E].Pos < I)
+      ++E;
+    BU.NextEvent[I] = E;
+  }
+  for (auto &KV : BU.LIL)
+    VRegLIL[KV.first] += KV.second;
+}
+
+// Compute the vector register pressure after each instruction and the live
+// interval length of each vector vreg for the code as it is now.
+void ExpandPseudos::computeVectorRegUsage(MachineFunction &MF,
+                                          LiveIntervals &LI) {
+  LIS = &LI;
+  LISValid = true;
+  VRPressure.clear();
+  VRegLIL.clear();
+  Usage.clear();
+
+  VRSet = ~0u;
+  for (unsigned i = 0, e = TRI->getNumRegPressureSets(); i != e; ++i)
+    if (StringRef(TRI->getRegPressureSetName(i)) == "VR")
+      VRSet = i;
+  RegClassInfo.runOnMachineFunction(MF);
+
+  for (MachineBasicBlock &MBB : MF) {
+    computeBlockUsage(MBB);
+    computeBlockPressure(MBB, VRPressure);
+  }
+
+  LLVM_DEBUG({
+    unsigned MaxRP = 0, SLIL = 0;
+    for (auto &KV : VRPressure)
+      MaxRP = std::max(MaxRP, KV.second);
+    for (auto &KV : VRegLIL)
+      SLIL += KV.second;
+    dbgs() << "Vector register usage: max VR pressure " << MaxRP << ", SLIL "
+           << SLIL << "\n";
+  });
+}
+
 bool ExpandPseudos::runProcess(MachineFunction &MF) {
 
   bool EverMadeChange = false;
 
   if (Remat) {
-    EverMadeChange |= ProcessRedundantReload(MF);
-    EverMadeChange |= ProcessRematLoads(MF);
+    bool Changed = ProcessRedundantReload(MF);
+    Changed |= ProcessRematLoads(MF);
+    EverMadeChange |= Changed;
+    if (Changed) {
+      // Instructions were created without updating LiveIntervals.
+      LISValid = false;
+      for (MachineBasicBlock &MBB : MF)
+        computeBlockUsage(MBB);
+    }
   }
   if (Sink)
     ProcessInSameBlock(MF);
@@ -1199,18 +1296,22 @@ bool ExpandPseudos::runProcess(MachineFunction &MF) {
 bool ExpandPseudos::runOnMachineFunction(MachineFunction &MF) {
   LLVM_DEBUG(dbgs() << "******** Expand Pseudos ********\n");
   if (!Sink && !a && !Remat) {
-    dbgs()<<"RISCV Sink disabled.\n";
+    dbgs()<<"Custom Sink disabled.\n";
     return false;
   } else if (Sink) {
-    dbgs()<<"RISCV Sink enabled.\n";
-  } else if (a) {
-    dbgs()<<"RISCV Affine enabled.\n";
+    std::string option = "";
+    if (Sink) option += " Sink";
+    if (Remat) option += " Remat";
+    if (a) option += " Affine";
+    dbgs()<<"Custom"<< option <<" enabled.\n";
   }
 
   STI = &MF.getSubtarget();
   TII = STI->getInstrInfo();
   TRI = STI->getRegisterInfo();
   MRI = &MF.getRegInfo();
+
+  computeVectorRegUsage(MF, getAnalysis<LiveIntervalsWrapperPass>().getLIS());
 
   bool MadeChange = false;
 
@@ -1236,7 +1337,7 @@ bool ExpandPseudos::runOnMachineFunction(MachineFunction &MF) {
         MadeChange = LowerCopy(MBB, MI);
         if (MadeChange) {
           LLVM_DEBUG(dbgs()<<"lowerCopy success.\n");
-	}
+        }
         break;
       case TargetOpcode::DBG_VALUE:
         continue;
