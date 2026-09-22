@@ -45,6 +45,23 @@ static cl::opt<bool>
     a("custom-a", cl::init(false), cl::Hidden,
                cl::desc("Enable affine"));
 
+static cl::opt<bool>
+    Reverse("custom-reverse", cl::init(false), cl::Hidden,
+            cl::desc("Reverse rematerialize values used early and needed "
+                     "again much later (possibly chained over several "
+                     "invertible ops) instead of keeping them live the "
+                     "whole time in between"));
+
+static cl::opt<bool>
+    Forward("custom-forward", cl::init(false), cl::Hidden,
+            cl::desc("Forward rematerialize values used early and needed "
+                     "again much later, by replaying the original chain of "
+                     "ops from a root that is already live for the whole "
+                     "region anyway (paper's Figure 2(b)); needs no "
+                     "algebraic inverse, so it also covers non-invertible "
+                     "ops like shifts and bitwise ops that -custom-reverse "
+                     "cannot"));
+
 ExpandPseudos::ExpandPseudos() : MachineFunctionPass(ID) {
   initializeExpandPseudosPass(*PassRegistry::getPassRegistry());
 }
@@ -232,6 +249,10 @@ bool ExpandPseudos::LowerCopy(MachineBasicBlock &MBB, MachineInstr &MI) {
             auto NewMI = CreateNewVMV(NewOpCode, isVI, PrevMI);
             NewMI->setDebugLoc(DL);
             MI.eraseFromParent();
+            // NewMI was inserted, and MI erased, without updating
+            // SlotIndexes/LiveIntervals: LIS no longer matches the
+            // instruction list, so later code must not call into it.
+            LISValid = false;
             return true;
           }
         }
@@ -600,112 +621,115 @@ void ExpandPseudos::ProcessInSameBlock(MachineFunction &MF) {
     AllSuccsCache AllSuccessors;
 
     // Sink LOAD
-    // For easy stdout review I iterate forward here.
-    bool ProcessedBegin, SawStore = false;
-    for (auto It = MBB.begin(); It != MBB.end(); ){
-      MachineInstr &MI = *It;
-      bool Sunk = false;
-      auto NextIt = std::next(It);
-      const TargetInstrInfo *TII = MI.getParent()->getParent()->getSubtarget().getInstrInfo();
-      StringRef Name = TII->getName(MI.getOpcode());
-      if (Name.contains("PseudoVMV_V_I")) {
-        const MachineOperand &Dst = MI.getOperand(0);
-        const MachineOperand &MO = MI.getOperand(1);
-        if (Dst.isReg() && MO.isReg() && Dst.getReg() == MO.getReg()) {
-          Register DstReg = Dst.getReg();
-          if (!SinkRegs.count(DstReg)) {
-            SinkRegs.insert(DstReg);
-            LLVM_DEBUG(dbgs()<<"Prepare to sink "<<MI);
-            if (FindFirstUseToSinkTo(MI, AllSuccessors)) {
-              LLVM_DEBUG(dbgs()<<"  Sink success.\n");
-              Sunk = true;
+    // Walk the basic block bottom-up, as MachineSink.cpp does: sinking moves
+    // an instruction later in the block, so processing from the end means a
+    // sunk instruction is never revisited and never invalidates the
+    // iterator for the instruction still to be processed.
+    if (!MBB.empty()) {
+      MachineBasicBlock::iterator It = std::prev(MBB.end());
+      bool ProcessedBegin;
+      do {
+        MachineInstr &MI = *It;
+
+        // Predecrement It (if it's not begin) so that it isn't invalidated by
+        // sinking MI later in the block.
+        ProcessedBegin = It == MBB.begin();
+        if (!ProcessedBegin)
+          --It;
+
+        const TargetInstrInfo *TII = MI.getParent()->getParent()->getSubtarget().getInstrInfo();
+        StringRef Name = TII->getName(MI.getOpcode());
+        if (Name.contains("PseudoVMV_V_I")) {
+          const MachineOperand &Dst = MI.getOperand(0);
+          const MachineOperand &MO = MI.getOperand(1);
+          if (Dst.isReg() && MO.isReg() && Dst.getReg() == MO.getReg()) {
+            Register DstReg = Dst.getReg();
+            if (!SinkRegs.count(DstReg)) {
+              SinkRegs.insert(DstReg);
+              LLVM_DEBUG(dbgs()<<"Prepare to sink "<<MI);
+              if (FindFirstUseToSinkTo(MI, AllSuccessors)) {
+                LLVM_DEBUG(dbgs()<<"  Sink success.\n");
+              }
             }
           }
         }
-      }
-      if (Name.contains("PseudoVMSLE_VI_M")) {
-        const MachineOperand &Dst = MI.getOperand(0);
-        const MachineOperand &Src = MI.getOperand(1);
-        if (Dst.isReg() && Src.isReg()) {
-          Register DstReg = Dst.getReg();
-          if (!SinkRegs.count(DstReg)) {
-            SinkRegs.insert(DstReg);
-            LLVM_DEBUG(dbgs()<<"Prepare to sink "<<MI);
-            if (FindFirstUseToSinkTo(MI, AllSuccessors)) {
-              LLVM_DEBUG(dbgs()<<"  Sink success.\n");
-              Sunk = true;
+        if (Name.contains("PseudoVMSLE_VI_M")) {
+          const MachineOperand &Dst = MI.getOperand(0);
+          const MachineOperand &Src = MI.getOperand(1);
+          if (Dst.isReg() && Src.isReg()) {
+            Register DstReg = Dst.getReg();
+            if (!SinkRegs.count(DstReg)) {
+              SinkRegs.insert(DstReg);
+              LLVM_DEBUG(dbgs()<<"Prepare to sink "<<MI);
+              if (FindFirstUseToSinkTo(MI, AllSuccessors)) {
+                LLVM_DEBUG(dbgs()<<"  Sink success.\n");
+              }
             }
           }
         }
-      }
-      if (Name.contains("PseudoVLE32_V_M") || isWholeRegLoadName(Name)) {
-        const MachineOperand &Dst = MI.getOperand(0);
-        const MachineOperand &Src = MI.getOperand(1);
-        if (Dst.isReg() && Src.isReg()) {
-          Register DstReg = Dst.getReg();
-          if (!SinkRegs.count(DstReg) && !RematRegs.count(DstReg) &&
-              MI.memoperands_begin() != MI.memoperands_end()) {
-            const MachineMemOperand *MMO = *MI.memoperands_begin();
-            if (const Value *PtrVal = MMO->getValue()) {
-              bool ShouldSink = false;
-              if (ShouldSink) {
-                SinkRegs.insert(DstReg);
-                LLVM_DEBUG(dbgs()<<"Prepare to sink Group "<<MI);
-                SmallVector<MachineInstr*, 4> InstructionsToSink;
-                InstructionsToSink.push_back(&MI);
-                Register LDReg = MI.getOperand(0).getReg();
-                Register MaskReg = 0;
-                for (MachineOperand &MO : MI.all_uses()) {
-                  if (MO.isReg() && !MO.getReg().isVirtual()) {
-                    LLVM_DEBUG(dbgs() <<"  MaskReg: " <<MO<<"\n");
-                    MaskReg = MO.getReg();
-                    break;
-                  }
-                }
-                if (MaskReg) {
-                  MachineInstr *MaskDef = nullptr;
-                  for (auto It = MI.getIterator(); It != MI.getParent()->begin(); --It) {
-                    MachineInstr &Candidate = *std::prev(It);
-                    //LLVM_DEBUG(dbgs() <<"  Reverse to find Mask: " <<Candidate);
-                    for (MachineOperand &DefMO : Candidate.all_defs()) {
-                      if (DefMO.isReg() && DefMO.getReg() == MaskReg) {
-                        MaskDef = &Candidate;
-                        break;
-                      }
-                    }
-                    if (MaskDef)
+        if (Name.contains("PseudoVLE32_V_M") || isWholeRegLoadName(Name)) {
+          const MachineOperand &Dst = MI.getOperand(0);
+          const MachineOperand &Src = MI.getOperand(1);
+          if (Dst.isReg() && Src.isReg()) {
+            Register DstReg = Dst.getReg();
+            if (!SinkRegs.count(DstReg) && !RematRegs.count(DstReg) &&
+                MI.memoperands_begin() != MI.memoperands_end()) {
+              const MachineMemOperand *MMO = *MI.memoperands_begin();
+              if (const Value *PtrVal = MMO->getValue()) {
+                bool ShouldSink = false;
+                if (ShouldSink) {
+                  SinkRegs.insert(DstReg);
+                  LLVM_DEBUG(dbgs()<<"Prepare to sink Group "<<MI);
+                  SmallVector<MachineInstr*, 4> InstructionsToSink;
+                  InstructionsToSink.push_back(&MI);
+                  Register LDReg = MI.getOperand(0).getReg();
+                  Register MaskReg = 0;
+                  for (MachineOperand &MO : MI.all_uses()) {
+                    if (MO.isReg() && !MO.getReg().isVirtual()) {
+                      LLVM_DEBUG(dbgs() <<"  MaskReg: " <<MO<<"\n");
+                      MaskReg = MO.getReg();
                       break;
+                    }
                   }
-                  StringRef Name = TII->getName(MaskDef->getOpcode());
-                  if (MaskDef && Name.contains("COPY")) {
-                    LLVM_DEBUG(dbgs() <<"  Mask: " <<*MaskDef);
-                    InstructionsToSink.push_back(MaskDef);
+                  if (MaskReg) {
+                    MachineInstr *MaskDef = nullptr;
+                    for (auto It = MI.getIterator(); It != MI.getParent()->begin(); --It) {
+                      MachineInstr &Candidate = *std::prev(It);
+                      //LLVM_DEBUG(dbgs() <<"  Reverse to find Mask: " <<Candidate);
+                      for (MachineOperand &DefMO : Candidate.all_defs()) {
+                        if (DefMO.isReg() && DefMO.getReg() == MaskReg) {
+                          MaskDef = &Candidate;
+                          break;
+                        }
+                      }
+                      if (MaskDef)
+                        break;
+                    }
+                    StringRef Name = TII->getName(MaskDef->getOpcode());
+                    if (MaskDef && Name.contains("COPY")) {
+                      LLVM_DEBUG(dbgs() <<"  Mask: " <<*MaskDef);
+                      InstructionsToSink.push_back(MaskDef);
+                    }
                   }
-                }
-                for (MachineInstr &UseMI : MRI->def_instructions(LDReg)) {
-                  if (&UseMI == &MI) continue;
-                  StringRef Name = TII->getName(UseMI.getOpcode());
-                  if (Name.contains("PseudoVMV_V_I_M8")) {
-                    LLVM_DEBUG(dbgs() <<"  VMV setup: " <<UseMI);
-                    InstructionsToSink.push_back(&UseMI);
-                    break;
+                  for (MachineInstr &UseMI : MRI->def_instructions(LDReg)) {
+                    if (&UseMI == &MI) continue;
+                    StringRef Name = TII->getName(UseMI.getOpcode());
+                    if (Name.contains("PseudoVMV_V_I_M8")) {
+                      LLVM_DEBUG(dbgs() <<"  VMV setup: " <<UseMI);
+                      InstructionsToSink.push_back(&UseMI);
+                      break;
+                    }
                   }
-                }
-                if (FindFirstUseToSinkToGroup(InstructionsToSink, AllSuccessors)) {
-                  LLVM_DEBUG(dbgs()<<"  Sink Group to first use success.\n");
-                  Sunk = true;
+                  if (FindFirstUseToSinkToGroup(InstructionsToSink, AllSuccessors)) {
+                    LLVM_DEBUG(dbgs()<<"  Sink Group to first use success.\n");
+                  }
                 }
               }
             }
           }
         }
-      }
-      if (Sunk) {
-        It = NextIt;
-      } else {
-        ++It;
-      }
-    }// while (!ProcessedBegin);
+      } while (!ProcessedBegin);
+    }
     SeenDbgUsers.clear();
     SeenDbgVars.clear();
     CachedRegisterPressure.clear();
@@ -746,7 +770,41 @@ void ExpandPseudos::ProcessInSameAffine(MachineFunction &MF) {
           LLVM_DEBUG(dbgs() << "  No VOR_Orig found, skipping\n");
           continue;
         }
-        MBB.splice(std::next(MI.getIterator()), &MBB, VOR_Orig->getIterator());
+        // VOR_Orig would like to move up to right after MI (the VID), but
+        // that is only safe if nothing between MI and VOR_Orig's current
+        // position defines a register VOR_Orig reads (e.g. its scalar
+        // operand, such as a base address computed after the VID but before
+        // the OR): moving past such a def would use it before it is
+        // defined. Instead of giving up in that case, move VOR_Orig up only
+        // as far as right after the last such dependency, which is still
+        // safe and still shortens the gap.
+        MachineInstr *LastDep = nullptr;
+        for (auto It = std::next(MI.getIterator());
+             It != VOR_Orig->getIterator(); ++It) {
+          for (const MachineOperand &Def : It->all_defs()) {
+            if (!Def.isReg() || !Def.getReg())
+              continue;
+            for (const MachineOperand &Use : VOR_Orig->all_uses()) {
+              if (Use.isReg() && Use.getReg() == Def.getReg()) {
+                LastDep = &*It;
+                break;
+              }
+            }
+          }
+        }
+        MachineBasicBlock::iterator InsertPt =
+            LastDep ? std::next(LastDep->getIterator())
+                    : std::next(MI.getIterator());
+        if (LastDep)
+          LLVM_DEBUG(dbgs() << "  VOR_Orig depends on a value defined "
+                                "between it and the VID, moving up only to "
+                                "just after: " << *LastDep);
+        if (InsertPt == VOR_Orig->getIterator()) {
+          LLVM_DEBUG(dbgs() << "  VOR_Orig is already right after its last "
+                                "dependency, nothing to move\n");
+        } else {
+          MBB.splice(InsertPt, &MBB, VOR_Orig->getIterator());
+        }
         for (MachineInstr *UseMI : Uses) {
           MachineOperand &ImmReg = UseMI->getOperand(3);
           MachineInstr *ImmDef = MRI->getUniqueVRegDef(ImmReg.getReg());
@@ -1127,6 +1185,401 @@ bool ExpandPseudos::ProcessRematLoads(MachineFunction &MF) {
   return Changed;
 }
 
+// The last real (non-debug, non-self-def) use of R in its own block, or
+// null. R must have a single definition. Used to anchor a reverse-remat
+// insertion point right after the value it depends on is no longer needed
+// for anything else, without searching from block-begin every time.
+static MachineInstr *findLastRealUseInBlock(Register R,
+                                             MachineRegisterInfo &MRI) {
+  auto Defs = MRI.def_instructions(R);
+  if (Defs.begin() == Defs.end())
+    return nullptr;
+  MachineInstr &Def = *Defs.begin();
+  MachineInstr *Last = nullptr;
+  for (auto It = std::next(Def.getIterator()); It != Def.getParent()->end();
+       ++It) {
+    if (It->isDebugInstr())
+      continue;
+    for (const MachineOperand &MO : It->operands())
+      if (MO.isReg() && MO.isUse() && MO.getReg() == R) {
+        Last = &*It;
+        break;
+      }
+  }
+  return Last;
+}
+
+// Reverse rematerialization (Bahi & Eisenbeis, "Register Reverse
+// Rematerialization"): recompute a value from something derived from it,
+// instead of keeping it alive, either as one hop:
+//   %C = PseudoVFADD_VV_M8_E32 undef %C, %A, %B, frm, %vl, sew, policy, implicit $frm
+//   ...
+//   %I = <last use of %C>
+//   %J = <uses %B again, much later>
+// %B is live from its own definition all the way to %J. But since
+// %C = %A + %B, %B can be reversibly recomputed from %C and %A as soon as
+// %C is no longer needed for anything else, i.e. right after %C's last use:
+//   %B2 = PseudoVFSUB_VV_M8_E32 undef %B2, %C, %A, frm, %vl, sew, policy, implicit $frm
+// and %J's use of %B is rewritten to use %B2 instead. This shortens the live
+// range of the original %B down to just [its def, %C's def], at the cost of
+// one extra instruction and a new short-lived value %B2.
+//
+// Or, chained over several links of vector-scalar ops each invertible with
+// the same scalar operand:
+//   %B = PseudoVFADD_VFPR32_*(undef %B, %A, %k1, ...)   ; B = A + k1
+//   %C = PseudoVFADD_VFPR32_*(undef %C, %B, %k2, ...)   ; C = B + k2
+//   %D = PseudoVFMUL_VFPR32_*(undef %D, %C, %k3, ...)   ; D = C * k3
+//   ...                                                  ; D's only forward
+//   ...                                                  ; uses, no gap
+//   %I = <uses %C again, much later>
+//   %J = <uses %B again, much later>
+//   %K = <uses %A again, much later>
+// Each of %A, %B and %C is only needed once more, much later, so each can be
+// reverse-rematerialized the same way as the single-hop case above: %C2 =
+// %D / k3 replaces %C's late use, %B2 = %C2 - k2 replaces %B's late use,
+// %A2 = %B2 - k1 replaces %A's late use. The key difference from just doing
+// three independent single-hop replacements is that %B2 must be computed
+// from %C2 (short-lived, still alive near %I), not from the original %C
+// (which by then has died right after producing %D) -- so the chain must be
+// walked from its deepest link (here, %D) backward, and each step's anchor
+// is looked up through the replacements already made by the deeper steps.
+bool ExpandPseudos::ProcessReverseRematChain(MachineFunction &MF) {
+  // Forward opcode -> reverse opcode, for Y = OP(X, K) => X = REV(Y, K).
+  // Note: integer PseudoVSLL_V*/PseudoVSRL_V* (shift) are deliberately not
+  // listed here, unlike the pairs below. Shift is not a safe reverse op:
+  // Y = X << k permanently discards X's top k bits, and Y = X >> k
+  // permanently discards its bottom k bits, so recomputing X as Y reversed
+  // by the opposite shift is only correct when those discarded bits happen
+  // to be zero, which this opcode-level match cannot verify. Unlike the
+  // float MUL/DIV pair below (exact in real arithmetic) or the ADD/SUB
+  // pairs (exact under any fixed-width wraparound), a shift "reversal"
+  // would silently compute wrong results for common inputs.
+  static const std::pair<unsigned, unsigned> Reversible[] = {
+      {RISCV::PseudoVFADD_VV_M4_E32, RISCV::PseudoVFSUB_VV_M4_E32},
+      {RISCV::PseudoVFADD_VV_M8_E32, RISCV::PseudoVFSUB_VV_M8_E32},
+      {RISCV::PseudoVFADD_VFPR32_M4_E32, RISCV::PseudoVFSUB_VFPR32_M4_E32},
+      {RISCV::PseudoVFADD_VFPR32_M8_E32, RISCV::PseudoVFSUB_VFPR32_M8_E32},
+      {RISCV::PseudoVFMUL_VFPR32_M4_E32, RISCV::PseudoVFDIV_VFPR32_M4_E32},
+      {RISCV::PseudoVFMUL_VFPR32_M8_E32, RISCV::PseudoVFDIV_VFPR32_M8_E32},
+      // Integer add: exact under 2's-complement wraparound for any k, so
+      // safe to reverse the same way regardless of runtime values.
+      {RISCV::PseudoVADD_VX_M4, RISCV::PseudoVSUB_VX_M4},
+      {RISCV::PseudoVADD_VX_M8, RISCV::PseudoVSUB_VX_M8},
+  };
+
+  bool Changed = false;
+  for (MachineBasicBlock &MBB : MF) {
+    // Original register -> its short-lived reverse-rematerialized
+    // replacement, populated as deeper links in the chain are processed.
+    DenseMap<Register, Register> ReplacedBy;
+    // Walk the block from its end backward: the link closest to the end of
+    // the chain (e.g. %D above) has no reverse-remat opportunity of its own
+    // and is handled first, so ReplacedBy has what an earlier link (e.g.
+    // %C's def) needs by the time it is processed.
+    for (MachineInstr &MI : llvm::reverse(MBB)) {
+      if (MI.isDebugInstr())
+        continue;
+      unsigned RevOpcode = 0;
+      for (auto &KV : Reversible)
+        if (MI.getOpcode() == KV.first) {
+          RevOpcode = KV.second;
+          break;
+        }
+      // Minimum operand count for dst, undef passthru, vs2, rs1/vs1, and at
+      // least vl/sew/policy: 7 for integer VX forms, 9 for the FP forms
+      // (which also have frm before vl and an implicit $frm at the end).
+      // The tail-copying loop below adapts to either shape automatically.
+      if (!RevOpcode || MI.getNumOperands() < 7 || !MI.getOperand(0).isReg() ||
+          !MI.getOperand(2).isReg() || !MI.getOperand(3).isReg())
+        continue;
+
+      Register Y = MI.getOperand(0).getReg();
+      Register Vs2 = MI.getOperand(2).getReg();
+      Register Vs1 = MI.getOperand(3).getReg();
+      if (!Y.isVirtual() || !Vs2.isVirtual())
+        continue;
+
+      // A vector-vector op (e.g. C = A + B) is commutative in which operand
+      // plays X (the one being reversed) vs. K (reused as-is in the reverse
+      // op): either could be the one with a later second use. A
+      // vector-scalar op's Vs1 is always a scalar FPR, never a value worth
+      // reverse-rematerializing, so only Vs2 is tried there.
+      SmallVector<std::pair<Register, Register>, 2> Candidates;
+      Candidates.push_back({Vs2, Vs1});
+      if (Vs1.isVirtual() && isVectorReg(Vs1, *MRI))
+        Candidates.push_back({Vs1, Vs2});
+
+      for (auto [X, K] : Candidates) {
+        // X must have exactly two real uses: defining Y here, and one other
+        // instruction. A tied self-use from a redefinition of X (e.g. a
+        // masked load's mask-undisturbed passthru) does not count.
+        unsigned NumRealUses = 0;
+        MachineInstr *UseX = nullptr;
+        for (MachineInstr &U : MRI->use_nodbg_instructions(X)) {
+          bool IsOwnDef = false;
+          for (const MachineOperand &Def : U.all_defs())
+            if (Def.getReg() == X) {
+              IsOwnDef = true;
+              break;
+            }
+          if (IsOwnDef)
+            continue;
+          ++NumRealUses;
+          if (&U != &MI)
+            UseX = &U;
+        }
+        if (NumRealUses != 2 || !UseX)
+          continue;
+
+        // Anchor on Y's current representative: if a deeper link already
+        // reverse-rematerialized Y, its short-lived replacement is the one
+        // actually alive late in the block; Y itself may have died right
+        // after this instruction.
+        Register Anchor = ReplacedBy.lookup(Y);
+        if (!Anchor)
+          Anchor = Y;
+        MachineInstr *LastUseOfAnchor = findLastRealUseInBlock(Anchor, *MRI);
+        if (!LastUseOfAnchor)
+          continue;
+        // UseX must come strictly after the anchor's last use: the new
+        // instruction is inserted right after LastUseOfAnchor, so if UseX
+        // were that same instruction (e.g. I = C + F, reversing C anchored
+        // on F, whose own only use is that same I), the insertion would
+        // need to land both before and after UseX, which is impossible.
+        bool AnchorBeforeUseX = false;
+        for (auto It = std::next(LastUseOfAnchor->getIterator());
+             It != MBB.end(); ++It)
+          if (&*It == UseX) {
+            AnchorBeforeUseX = true;
+            break;
+          }
+        if (!AnchorBeforeUseX)
+          continue;
+
+        LLVM_DEBUG(dbgs() << "ReverseRematChain: recompute "
+                          << printReg(X, TRI) << " from "
+                          << printReg(Anchor, TRI) << " after "
+                          << *LastUseOfAnchor << "  for use in " << *UseX);
+
+        Register NewX = MRI->createVirtualRegister(MRI->getRegClass(X));
+        MachineBasicBlock::iterator InsertPt =
+            std::next(LastUseOfAnchor->getIterator());
+        MachineInstrBuilder MIB =
+            BuildMI(MBB, InsertPt, MI.getDebugLoc(), TII->get(RevOpcode));
+        MIB.addReg(NewX, RegState::Define);
+        MIB.addReg(NewX, RegState::Undef);
+        MIB.addReg(Anchor);
+        MIB.addReg(K);
+        for (unsigned i = 4, e = MI.getNumOperands(); i != e; ++i)
+          MIB.add(MI.getOperand(i));
+        MIB->setFlags(MI.getFlags());
+
+        for (MachineOperand &MO : UseX->operands())
+          if (MO.isReg() && MO.isUse() && MO.getReg() == X)
+            MO.setReg(NewX);
+
+        RegsToClearKillFlags.insert(X);
+        RegsToClearKillFlags.insert(Anchor);
+        RegsToClearKillFlags.insert(K);
+        ReplacedBy[X] = NewX;
+        LISValid = false;
+        Changed = true;
+      }
+    }
+  }
+  return Changed;
+}
+
+// A simple vector ALU op that can be a link in a rematerialization chain:
+// %Y = PseudoV<MNEMONIC>_(VV|VX|VI|VFPR32)_M<n>[_E<sew>] undef %Y, %X, %K, ...
+// i.e. exactly the operand shape ProcessReverseRematChain and
+// ProcessForwardRematChain both key off (dst, undef passthru, vs2, then a
+// second operand that is reused as-is, whether register or immediate).
+// Matched by mnemonic prefix rather than a fixed opcode list, so it covers
+// LMUL4/M8, integer and float, and VV/VX/VI/VFPR32 forms uniformly; masked
+// forms are excluded since their extra mask/passthru operands don't fit
+// this shape.
+static bool isChainLinkInstr(const TargetInstrInfo *TII,
+                              const MachineInstr &MI) {
+  static const char *Mnemonics[] = {
+      "PseudoVADD_",  "PseudoVSUB_",  "PseudoVRSUB_", "PseudoVMUL_",
+      "PseudoVDIV_",  "PseudoVAND_",  "PseudoVOR_",   "PseudoVXOR_",
+      "PseudoVSLL_",  "PseudoVSRL_",  "PseudoVSRA_",  "PseudoVFADD_",
+      "PseudoVFSUB_", "PseudoVFRSUB_", "PseudoVFMUL_", "PseudoVFDIV_",
+  };
+  StringRef Name = TII->getName(MI.getOpcode());
+  if (Name.contains("MASK"))
+    return false;
+  bool KnownMnemonic = false;
+  for (const char *M : Mnemonics)
+    if (Name.starts_with(M)) {
+      KnownMnemonic = true;
+      break;
+    }
+  return KnownMnemonic && MI.getNumOperands() >= 4 &&
+         MI.getOperand(0).isReg() && MI.getOperand(1).isReg() &&
+         MI.getOperand(1).isUndef() && MI.getOperand(2).isReg();
+}
+
+// Figure 2(b) of the paper ("multiple instruction rematerialization"):
+// instead of storing an intermediate value across a long gap (the problem
+// ProcessReverseRematChain also solves, by reverse-computing it from
+// something derived *later*), replay the *original* forward chain of
+// instructions from a root value that is already live for the whole region
+// anyway (e.g. a loaded input also needed again at the very end) to
+// recompute the value fresh right where it is next needed:
+//   %R = <root, e.g. a load, still needed much later at some other use>
+//   %B = PseudoVADD_VX_M8 undef %B, %R, %k1, ...   ; B = R + k1
+//   %C = PseudoVADD_VX_M8 undef %C, %B, %k2, ...   ; C = B + k2
+//   ...
+//   %I = <uses %C again, much later>
+//   %J = <uses %B again, much later>
+// becomes, right before each late use, a fresh replay of the chain from %R:
+//   %B2 = PseudoVADD_VX_M8 undef %B2, %R, %k1, ...            ; before %J
+//   %J = <rewritten to use %B2>
+//   %Ca = PseudoVADD_VX_M8 undef %Ca, %R, %k1, ...            ; before %I
+//   %C2 = PseudoVADD_VX_M8 undef %C2, %Ca, %k2, ...
+//   %I = <rewritten to use %C2>
+// Unlike reverse computation, this needs no algebraic inverse, so it is
+// exact for *any* chain of ops -- including non-invertible ones like
+// shifts or bitwise ops that ProcessReverseRematChain cannot touch -- at
+// the cost of redoing however many steps lie between the root and the
+// value, redundantly across different late uses if their chains overlap.
+// The paper explicitly accepts that cost: "we don't consider this
+// tradeoff and consider computation is free".
+bool ExpandPseudos::ProcessForwardRematChain(MachineFunction &MF) {
+  bool Changed = false;
+  for (MachineBasicBlock &MBB : MF) {
+    for (MachineInstr &MI : llvm::make_early_inc_range(MBB)) {
+      if (MI.isDebugInstr() || !isChainLinkInstr(TII, MI))
+        continue;
+
+      // The candidate to recompute is normally the vs2 operand (Vs2), but
+      // for a vector-vector op either operand could be the one with a
+      // later second use (as in ProcessReverseRematChain); a vector-scalar
+      // or vector-immediate op only ever has Vs2 as a candidate.
+      Register Vs2 = MI.getOperand(2).getReg();
+      SmallVector<Register, 2> Candidates;
+      Candidates.push_back(Vs2);
+      if (MI.getOperand(3).isReg()) {
+        Register Vs1 = MI.getOperand(3).getReg();
+        if (Vs1.isVirtual() && isVectorReg(Vs1, *MRI))
+          Candidates.push_back(Vs1);
+      }
+
+      for (Register X : Candidates) {
+        if (!X.isVirtual())
+          continue;
+        // X must have exactly two real uses: defining this link, and one
+        // other, later instruction -- the same self-def exclusion as
+        // ProcessReverseRematChain, for masked-redefinition passthrus.
+        unsigned NumRealUses = 0;
+        MachineInstr *UseX = nullptr;
+        for (MachineInstr &U : MRI->use_nodbg_instructions(X)) {
+          bool IsOwnDef = false;
+          for (const MachineOperand &Def : U.all_defs())
+            if (Def.getReg() == X) {
+              IsOwnDef = true;
+              break;
+            }
+          if (IsOwnDef)
+            continue;
+          ++NumRealUses;
+          if (&U != &MI)
+            UseX = &U;
+        }
+        if (NumRealUses != 2 || !UseX || UseX->getParent() != &MBB)
+          continue;
+
+        // Walk X's own ancestor chain of chain-link defs back to a root
+        // that is not itself a chain-link result (e.g. a load). An empty
+        // chain means X already *is* such a root: nothing cheaper to
+        // replay it from, so there is nothing to do.
+        SmallVector<MachineInstr *, 8> Chain; // built X-to-root, used root-to-X
+        Register Cur = X;
+        bool Ok = true;
+        while (Chain.size() <= 8) {
+          if (!Cur.isVirtual()) {
+            Ok = false;
+            break;
+          }
+          auto Defs = MRI->def_instructions(Cur);
+          if (Defs.begin() == Defs.end()) {
+            Ok = false;
+            break;
+          }
+          MachineInstr &Def = *Defs.begin();
+          if (!isChainLinkInstr(TII, Def) || Def.getParent() != &MBB)
+            break; // Cur is the root.
+          Chain.push_back(&Def);
+          Cur = Def.getOperand(2).getReg();
+        }
+        if (!Ok || Chain.empty())
+          continue;
+        Register Root = Cur;
+        std::reverse(Chain.begin(), Chain.end());
+
+        // Only worth it if Root is already live at UseX anyway (another
+        // use there or later, or in a different block): otherwise
+        // replaying the chain would just extend Root's own live range
+        // instead of shrinking anything, the same profitability check
+        // ProcessRematLoads makes.
+        bool RootLive = false;
+        for (MachineOperand &MO : MRI->use_nodbg_operands(Root)) {
+          MachineInstr *U = MO.getParent();
+          if (U->getParent() != &MBB) {
+            RootLive = true;
+            break;
+          }
+          for (auto It = UseX->getIterator(); It != MBB.end(); ++It)
+            if (&*It == U) {
+              RootLive = true;
+              break;
+            }
+          if (RootLive)
+            break;
+        }
+        if (!RootLive)
+          continue;
+
+        LLVM_DEBUG(dbgs() << "ForwardRematChain: replay " << Chain.size()
+                          << " step(s) from " << printReg(Root, TRI)
+                          << " to recompute " << printReg(X, TRI)
+                          << " for use in " << *UseX);
+
+        Register Prev = Root;
+        for (MachineInstr *Link : Chain) {
+          bool IsLast = Link == Chain.back();
+          Register Dst = MRI->createVirtualRegister(
+              IsLast ? MRI->getRegClass(X)
+                     : MRI->getRegClass(Link->getOperand(0).getReg()));
+          MachineInstrBuilder MIB = BuildMI(MBB, UseX->getIterator(),
+                                            Link->getDebugLoc(),
+                                            TII->get(Link->getOpcode()));
+          MIB.addReg(Dst, RegState::Define);
+          MIB.addReg(Dst, RegState::Undef);
+          MIB.addReg(Prev);
+          MIB.add(Link->getOperand(3));
+          for (unsigned i = 4, e = Link->getNumOperands(); i != e; ++i)
+            MIB.add(Link->getOperand(i));
+          MIB->setFlags(Link->getFlags());
+          Prev = Dst;
+        }
+
+        for (MachineOperand &MO : UseX->operands())
+          if (MO.isReg() && MO.isUse() && MO.getReg() == X)
+            MO.setReg(Prev);
+
+        RegsToClearKillFlags.insert(X);
+        RegsToClearKillFlags.insert(Root);
+        LISValid = false;
+        Changed = true;
+      }
+    }
+  }
+  return Changed;
+}
+
 // Vector register pressure right after each instruction of MBB, tracked with
 // RegPressureTracker as RISCVRegisterPressure does. Needs valid LiveIntervals.
 void ExpandPseudos::computeBlockPressure(
@@ -1264,6 +1717,39 @@ void ExpandPseudos::computeVectorRegUsage(MachineFunction &MF,
   });
 }
 
+// Peak vector-register pressure across the whole function and the sum of
+// live-interval lengths (SLIL), computed purely from Usage/VRegLIL (a plain
+// operand scan, kept up to date by every transform via computeBlockUsage).
+// Unlike computeVectorRegUsage's own MaxRP (via RegPressureTracker), this
+// does not need LiveIntervals, so it is safe to call after transforms that
+// leave LISValid false, to see whether pressure and SLIL actually went down.
+std::pair<unsigned, unsigned> ExpandPseudos::computeCurrentUsage() const {
+  unsigned MaxPressure = 0;
+  for (auto &BlockKV : Usage) {
+    const BlockUsage &BU = BlockKV.second;
+    unsigned Running = 0;
+    for (unsigned I = 0, E = BU.Events.size(); I != E;) {
+      unsigned Pos = BU.Events[I].Pos;
+      unsigned J = I;
+      while (J != E && BU.Events[J].Pos == Pos)
+        ++J;
+      // Apply this position's whole net delta (its DEFs and its own
+      // operands' LAST USEs) atomically before checking the max: they
+      // belong to the same instruction, whose destination can reuse a
+      // dying source's register, so they are never simultaneously live.
+      for (unsigned K = I; K != J; ++K)
+        if (BU.Events[K].Pressure)
+          Running += BU.Events[K].IsDef ? BU.Events[K].W : -BU.Events[K].W;
+      MaxPressure = std::max(MaxPressure, Running);
+      I = J;
+    }
+  }
+  unsigned SLIL = 0;
+  for (auto &KV : VRegLIL)
+    SLIL += KV.second;
+  return {MaxPressure, SLIL};
+}
+
 bool ExpandPseudos::runProcess(MachineFunction &MF) {
 
   bool EverMadeChange = false;
@@ -1271,6 +1757,26 @@ bool ExpandPseudos::runProcess(MachineFunction &MF) {
   if (Remat) {
     bool Changed = ProcessRedundantReload(MF);
     Changed |= ProcessRematLoads(MF);
+    EverMadeChange |= Changed;
+    if (Changed) {
+      // Instructions were created without updating LiveIntervals.
+      LISValid = false;
+      for (MachineBasicBlock &MBB : MF)
+        computeBlockUsage(MBB);
+    }
+  }
+  if (Reverse) {
+    bool Changed = ProcessReverseRematChain(MF);
+    EverMadeChange |= Changed;
+    if (Changed) {
+      // Instructions were created without updating LiveIntervals.
+      LISValid = false;
+      for (MachineBasicBlock &MBB : MF)
+        computeBlockUsage(MBB);
+    }
+  }
+  if (Forward) {
+    bool Changed = ProcessForwardRematChain(MF);
     EverMadeChange |= Changed;
     if (Changed) {
       // Instructions were created without updating LiveIntervals.
@@ -1295,7 +1801,7 @@ bool ExpandPseudos::runProcess(MachineFunction &MF) {
 
 bool ExpandPseudos::runOnMachineFunction(MachineFunction &MF) {
   LLVM_DEBUG(dbgs() << "******** Expand Pseudos ********\n");
-  if (!Sink && !a && !Remat) {
+  if (!Sink && !a && !Remat && !Reverse && !Forward) {
     dbgs()<<"Custom Sink disabled.\n";
     return false;
   } else if (Sink) {
@@ -1303,6 +1809,8 @@ bool ExpandPseudos::runOnMachineFunction(MachineFunction &MF) {
     if (Sink) option += " Sink";
     if (Remat) option += " Remat";
     if (a) option += " Affine";
+    if (Reverse) option += " Reverse";
+    if (Forward) option += " Forward";
     dbgs()<<"Custom"<< option <<" enabled.\n";
   }
 
@@ -1312,6 +1820,11 @@ bool ExpandPseudos::runOnMachineFunction(MachineFunction &MF) {
   MRI = &MF.getRegInfo();
 
   computeVectorRegUsage(MF, getAnalysis<LiveIntervalsWrapperPass>().getLIS());
+  LLVM_DEBUG({
+    auto [MaxRP, SLIL] = computeCurrentUsage();
+    dbgs() << "Before transforms (LIS-independent): max VR pressure " << MaxRP
+           << ", SLIL " << SLIL << "\n";
+  });
 
   bool MadeChange = false;
 
@@ -1349,6 +1862,12 @@ bool ExpandPseudos::runOnMachineFunction(MachineFunction &MF) {
   }
 
   MadeChange |= runProcess(MF);
+
+  LLVM_DEBUG({
+    auto [MaxRP, SLIL] = computeCurrentUsage();
+    dbgs() << "After transforms (LIS-independent): max VR pressure " << MaxRP
+           << ", SLIL " << SLIL << "\n";
+  });
 
   return MadeChange;
 }
