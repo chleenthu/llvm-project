@@ -129,11 +129,14 @@ private:
   bool FindFirstUseToSinkToGroup(
     SmallVectorImpl<MachineInstr *> &InstrsToSink, AllSuccsCache &AllSuccessors);
   void computeVectorRegUsage(MachineFunction &MF, LiveIntervals &LIS);
+  std::pair<unsigned, unsigned> computeCurrentUsage() const;
   void computeBlockUsage(MachineBasicBlock &MBB);
   void computeBlockPressure(MachineBasicBlock &MBB,
                             DenseMap<const MachineInstr *, unsigned> &Out);
   bool ProcessRedundantReload(MachineFunction &MF);
   bool ProcessRematLoads(MachineFunction &MF);
+  bool ProcessReverseRematChain(MachineFunction &MF);
+  bool ProcessForwardRematChain(MachineFunction &MF);
   void ProcessInSameBlock(MachineFunction &MF);
   void ProcessInSameAffine(MachineFunction &MF);
   bool runProcess(MachineFunction &MF);
