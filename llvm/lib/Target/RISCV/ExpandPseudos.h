@@ -136,7 +136,6 @@ private:
   bool ProcessRedundantReload(MachineFunction &MF);
   bool ProcessRematLoads(MachineFunction &MF);
   bool ProcessReverseRematChain(MachineFunction &MF);
-  bool ProcessForwardRematChain(MachineFunction &MF);
   void ProcessInSameBlock(MachineFunction &MF);
   void ProcessInSameAffine(MachineFunction &MF);
   bool runProcess(MachineFunction &MF);
