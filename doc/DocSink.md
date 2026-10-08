@@ -1,17 +1,11 @@
 # Group Sink Optimization
 
 `ProcessInSameBlock` has a targeted group-sinking path for selected masked
-32-bit vector loads.  It recognizes selected loads and moves the load together with the setup needed to execute it immediately before its vector arithmetic consumer.
+32-bit vector loads.  It recognizes selected loads and `FindFirstUseToSinkToGroup` moves the load together with the setup needed to execute it immediately before its vector arithmetic consumer.
 
 The group is only moved within the same machine basic block.
 
 ## Intended pattern
-
-A masked `PseudoVLE32_V_M8_MASK` load is selected when its memory operand has an offset of at least half a block:
-
-```text
-memory offset >= (BlockSize / 2) * 4
-```
 
 The full expected idiom is:
 
@@ -56,18 +50,7 @@ The pass sinks the `PseudoVMV_V_I` directly before the load:
 %55 = PseudoVLE32_V_M8_MASK %55, %54, $v0, %vl, 5, 1
 ```
 
-## What `ProcessInSameBlock` actually checks
-
-- It starts at the `PseudoVMV_V_I`.
-- It looks specifically for a following `PseudoVLE32_V_M8_MASK` with the same tied destination.
-
-# Sink-to-First-Use Optimization
-
-`ProcessInSameBlock` sinks a mask-producing compare, `PseudoVMSLE_VI_M*`, with `FindFirstUseToSinkTo`.  It moves the compare immediately before the first instruction that uses its result.
-
-## Intended pattern
-
-Before sinking, unrelated instructions may separate the compare from its first use:
+Another example is a mask-producing compare `PseudoVMSLE_VI_M*`.
 
 ```text
 %33 = PseudoVMSLE_VI_M4 %30, 0, %vl, 5
@@ -75,7 +58,7 @@ Before sinking, unrelated instructions may separate the compare from its first u
 $v0 = COPY %33
 ```
 
-The pass sinks the compare directly before that use:
+The pass sinks `PseudoVMSLE_VI_M*` directly before that use:
 
 ```text
 ... unrelated instructions ...
@@ -85,15 +68,8 @@ $v0 = COPY %33
 
 ## What `FindFirstUseToSinkTo` actually checks
 
-- The instruction has exactly one explicit def, and it is a virtual register.
-- `isSafeToMove` holds and the instruction is not convergent.
-- All uses of the result are in the same block.  The first one after the instruction is the target.
-- It does nothing if there is no such use, or if the instruction is already just before it.
-- No call, side-effecting instruction, or store that could clobber a load lies between the instruction and the target.
-- No register conflict with the instructions crossed: a def of the moved instruction's registers conflicts with any access, and a use conflicts with a def.
-- The moved instruction's source registers are added to `RegsToClearKillFlags`.
-
-Unlike the group sink, which stops two instructions before the use, this path places the instruction just before it.
+- It starts at the `PseudoVMV_V_I`.
+- It looks specifically for a following `PseudoVLE32_V_M8_MASK` with the same tied destination.
 
 # Expand-Pseudos COPY-to-VMV Optimization
 
@@ -140,8 +116,6 @@ original %55 VMV -> COPY to a destination -> LowerCopy creates VMV -> single sin
 ```
 
 This shows that `LowerCopy` creates independent zero/undisturbed setups for copied vector destinations.
-
-## Observed instances and connection to sink-to-first-use
 
 In `s279` the mask compare `%33` is produced early and only consumed by the mask `COPY` to `$v0` about ten instructions later.  Before sinking:
 
