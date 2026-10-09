@@ -35,8 +35,25 @@ INITIALIZE_PASS(ExpandPseudos, DEBUG_TYPE, RISCV_INSERT_VSETVLI_NAME,
                 false, false)
 
 static cl::opt<bool>
+    Copy("custom-copy", cl::init(false), cl::Hidden,
+         cl::desc("Turn a COPY of a vector splat (vmv.v.i 0 / vmv.v.x) into "
+                  "the splat written directly to the COPY destination"));
+
+static cl::opt<bool>
     Sink("custom-sink", cl::init(false), cl::Hidden,
                cl::desc("Enable sinking"));
+
+static cl::opt<bool>
+    a("custom-a", cl::init(false), cl::Hidden,
+               cl::desc("Enable affine"));
+
+static cl::opt<bool>
+    Thresh("custom-thresh", cl::init(false), cl::Hidden,
+           cl::desc("Turn a bound check (vid.v + s1 + ... + sk) < n into "
+                    "vid.v < (n - s1 - ... - sk), with the offsets "
+                    "subtracted from n in scalar registers, so the "
+                    "vadd.vx / disjoint vor.vx chain before the vmslt.vx "
+                    "goes away"));
 
 static cl::opt<bool>
     Remat("custom-remat", cl::init(false), cl::Hidden,
@@ -48,10 +65,6 @@ static cl::opt<bool>
 // that gap.
 static constexpr unsigned RematGap = 6;
 static constexpr unsigned RematMinUses = 2;
-
-static cl::opt<bool>
-    a("custom-a", cl::init(false), cl::Hidden,
-               cl::desc("Enable affine"));
 
 static cl::opt<bool>
     Reverse("custom-reverse", cl::init(false), cl::Hidden,
@@ -80,6 +93,120 @@ static bool isVectorReg(Register R, const MachineRegisterInfo &MRI) {
   if (R.isVirtual())
     return RISCVRI::isVRegClass(MRI.getRegClass(R)->TSFlags);
   return R.isPhysical() && RISCV::VRRegClass.contains(R);
+}
+
+// The independent instructions a consumer needs after the vector producer it
+// reads so that it does not stall on the X60 (doc/DocStall.md, "Minimum gap
+// when sinking"): Vec when vector instructions are among them, Scalar when
+// they are all scalar. From m4 up there is no stall: each instruction keeps
+// its unit busy long enough to cover the latency, so the producer can sit
+// directly before the consumer.
+struct StallGap {
+  unsigned Vec = 0, Scalar = 0;
+};
+
+// Integer multiplies need more distance than adds; vfmul does not.
+static bool isIntMulName(StringRef Name) {
+  return Name.starts_with("PseudoVMUL") || Name.starts_with("PseudoVMADD") ||
+         Name.starts_with("PseudoVMACC") || Name.starts_with("PseudoVNMSAC") ||
+         Name.starts_with("PseudoVNMSUB") || Name.starts_with("PseudoVWMUL") ||
+         Name.starts_with("PseudoVWMACC");
+}
+
+// LMUL in registers (1 for a fractional LMUL) of an RVV pseudo, or 0 if the
+// opcode does not carry one.
+static unsigned pseudoLMul(const MCInstrDesc &Desc) {
+  if (!RISCVII::hasSEWOp(Desc.TSFlags))
+    return 0;
+  auto [LMul, Fractional] =
+      RISCVVType::decodeVLMUL(RISCVII::getLMul(Desc.TSFlags));
+  return Fractional ? 1 : LMul;
+}
+
+// LC / CC / CS / LS rows of the table, by the producer's LMUL.
+static StallGap minStallGap(unsigned LMul, bool ProducerLoads,
+                            bool ConsumerStores, bool IntMul) {
+  if (LMul >= 4)
+    return {0, 0};
+  bool M1 = LMul <= 1;
+  if (ProducerLoads && ConsumerStores) // LS
+    return M1 ? StallGap{4, 8} : StallGap{0, 0};
+  if (ProducerLoads) // LC
+    return {1, 4};
+  if (ConsumerStores) // CS
+    return M1 ? (IntMul ? StallGap{3, 6} : StallGap{3, 5})
+              : (IntMul ? StallGap{2, 6} : StallGap{0, 0});
+  // CC
+  return M1 ? (IntMul ? StallGap{3, 12} : StallGap{2, 10})
+            : (IntMul ? StallGap{1, 12} : StallGap{1, 7});
+}
+
+// The gap Consumer needs after Producer, an existing instruction. Its LMUL
+// comes from the pseudo, or from its result's register class (COPY, whole
+// register loads).
+static StallGap minStallGap(const MachineInstr &Producer,
+                            const MachineInstr &Consumer,
+                            const MachineRegisterInfo &MRI,
+                            const TargetRegisterInfo &TRI,
+                            const TargetInstrInfo &TII) {
+  unsigned LMul = pseudoLMul(Producer.getDesc());
+  if (!LMul) {
+    LMul = 1;
+    if (Producer.getNumExplicitDefs() && Producer.getOperand(0).isReg()) {
+      Register R = Producer.getOperand(0).getReg();
+      if (R.isVirtual() && isVectorReg(R, MRI))
+        LMul = TRI.getRegClassWeight(MRI.getRegClass(R)).RegWeight;
+    }
+  }
+  bool IntMul = isIntMulName(TII.getName(Producer.getOpcode())) ||
+                isIntMulName(TII.getName(Consumer.getOpcode()));
+  StallGap Need =
+      minStallGap(LMul, Producer.mayLoad(), Consumer.mayStore(), IntMul);
+  LLVM_DEBUG(dbgs() << "  Stall gap: LMUL " << LMul << ", "
+                    << (Producer.mayLoad() ? "L" : "C")
+                    << (Consumer.mayStore() ? "S" : "C")
+                    << (IntMul ? " int mul" : "") << ", need " << Need.Vec
+                    << " vector / " << Need.Scalar << " scalar, producer "
+                    << TII.getName(Producer.getOpcode()) << "\n");
+  return Need;
+}
+
+static bool isVectorInstr(const MachineInstr &MI,
+                          const MachineRegisterInfo &MRI) {
+  return llvm::any_of(MI.operands(), [&](const MachineOperand &MO) {
+    return MO.isReg() && MO.getReg() && isVectorReg(MO.getReg(), MRI);
+  });
+}
+
+// Whether Vec vector and Scalar scalar instructions cover Need. Mixed
+// fillers were not measured; a scalar one counts a quarter of a vector one.
+static bool coversStallGap(StallGap Need, unsigned Vec, unsigned Scalar) {
+  if (Vec)
+    return 4 * Vec + Scalar >= 4 * Need.Vec;
+  return Scalar >= Need.Scalar;
+}
+
+// The latest point before Consumer to insert a producer at so that Need sits
+// between them, without walking back to Limit (the producer's own position,
+// or an instruction the new value must follow). None if the gap does not fit
+// after Limit. With no gap needed, that is Consumer itself.
+static std::optional<MachineBasicBlock::iterator>
+stallGapInsertPoint(MachineInstr &Consumer, const MachineInstr *Limit,
+                    StallGap Need, const MachineRegisterInfo &MRI) {
+  MachineBasicBlock &MBB = *Consumer.getParent();
+  MachineBasicBlock::iterator It = Consumer.getIterator();
+  unsigned Vec = 0, Scalar = 0;
+  while (!coversStallGap(Need, Vec, Scalar)) {
+    do {
+      if (It == MBB.begin())
+        return std::nullopt;
+      --It;
+    } while (It->isDebugInstr());
+    if (&*It == Limit)
+      return std::nullopt;
+    ++(isVectorInstr(*It, MRI) ? Vec : Scalar);
+  }
+  return It;
 }
 
 // Sum of live interval lengths (SLIL) of the vector virtual registers used in
@@ -129,88 +256,76 @@ static bool isWholeRegLoadName(StringRef Name) {
   return IsNumber(NF) && IsNumber(EEW);
 }
 
+// Turn %dst = COPY %src, where %src is a splat (vmv.v.i of 0, or vmv.v.x)
+// with an undef passthru, into the same splat writing %dst directly, at any
+// LMUL. %dst then no longer depends on %src, so %src can die earlier.
 bool ExpandPseudos::LowerCopy(MachineBasicBlock &MBB, MachineInstr &MI) {
-  bool MadeChange = false;
-  if (MI.getNumOperands() >= 2 &&
-            MI.getOperand(0).isReg() &&
-            MI.getOperand(1).isReg()) {
+  if (MI.getNumOperands() < 2 || !MI.getOperand(0).isReg() ||
+      !MI.getOperand(1).isReg() || MI.getOperand(0).getSubReg() ||
+      MI.getOperand(1).getSubReg())
+    return false;
   Register DstReg = MI.getOperand(0).getReg();
   Register SrcReg = MI.getOperand(1).getReg();
-    if (DstReg.isVirtual() && SrcReg.isVirtual()) {
-      const TargetRegisterClass *DstRC = MRI->getRegClass(DstReg);
-      const TargetRegisterClass *SrcRC = MRI->getRegClass(SrcReg);
-      StringRef DstName = TRI->getRegClassName(DstRC);
-      StringRef SrcName = TRI->getRegClassName(SrcRC);
-      if (DstName.contains("VRM8") && SrcName.contains("VRM8")) {
-        LLVM_DEBUG(dbgs() << "lowerCopy: "<<MI);
-        unsigned SEW = 5;
-        DebugLoc DL = MI.getDebugLoc();
-        MachineBasicBlock::iterator MBBI = MI.getIterator();
-        Register VLReg;
-        Register VXReg;
-        unsigned NewOpCode = 0;
-        bool isVI = false;
-        auto CreateNewVMV = [&](unsigned OpCode, bool isVI,
-                                MachineInstr &PrevMI) -> MachineInstr * {
-          MachineInstrBuilder MIB = BuildMI(MBB, MBBI, DL,
-                                            TII->get(OpCode));
-          MIB.addReg(DstReg, RegState::Define);
-          MIB.addReg(DstReg, RegState::Undef);
-          if (isVI)
-            MIB.addImm(0);
-          else
-            MIB.addReg(VXReg);
-          MIB.addReg(VLReg);
-          MIB.addImm(SEW);
-          MIB.addImm(0);
-          MIB.copyImplicitOps(PrevMI);
-          return MIB;
-        };
-        for (auto It = MBB.begin(); It != MI.getIterator(); ++It) {
-          MachineInstr &PrevMI = *It;
-          if (PrevMI.getOpcode() == RISCV::PseudoVMV_V_I_M8 &&
-            PrevMI.getOperand(0).isReg() &&
-            PrevMI.getOperand(0).getReg() == SrcReg &&
-            PrevMI.getNumOperands() >= 2 &&
-            PrevMI.getOperand(2).isImm() &&
-            PrevMI.getOperand(2).getImm() == 0) {
-            if (PrevMI.getNumOperands() >= 4) {
-              if (PrevMI.getOperand(3).isReg())
-                 VLReg = PrevMI.getOperand(3).getReg();
-            }
-            NewOpCode = RISCV::PseudoVMV_V_I_M8;
-            isVI = true;
-          }
-          else if (PrevMI.getOpcode() == RISCV::PseudoVMV_V_X_M8 &&
-            PrevMI.getOperand(0).isReg() &&
-            PrevMI.getOperand(0).getReg() == SrcReg &&
-            PrevMI.getNumOperands() >= 2 &&
-            PrevMI.getOperand(2).isReg()) {
-            if (PrevMI.getNumOperands() >= 4) {
-              if (PrevMI.getOperand(2).isReg())
-                 VXReg = PrevMI.getOperand(2).getReg();
-              if (PrevMI.getOperand(3).isReg())
-                 VLReg = PrevMI.getOperand(3).getReg();
-            }
-            NewOpCode = RISCV::PseudoVMV_V_X_M8;
-            isVI = false;
-          }
-          if (NewOpCode) {
-            LLVM_DEBUG(dbgs() << "Replacing COPY with VMV: SEW=" << SEW << "\n");
-            auto NewMI = CreateNewVMV(NewOpCode, isVI, PrevMI);
-            NewMI->setDebugLoc(DL);
-            MI.eraseFromParent();
-            // NewMI was inserted, and MI erased, without updating
-            // SlotIndexes/LiveIntervals: LIS no longer matches the
-            // instruction list, so later code must not call into it.
-            LISValid = false;
-            return true;
-          }
-        }
-      }
+  if (!DstReg.isVirtual() || !SrcReg.isVirtual() ||
+      !isVectorReg(DstReg, *MRI) || !isVectorReg(SrcReg, *MRI))
+    return false;
+
+  // The value the COPY reads: the last def of SrcReg before it in the block.
+  MachineInstr *Def = nullptr;
+  for (auto It = MI.getIterator(); It != MBB.begin();) {
+    --It;
+    if (It->modifiesRegister(SrcReg, TRI)) {
+      Def = &*It;
+      break;
     }
   }
-  return MadeChange;
+  if (!Def)
+    return false;
+  StringRef Name = TII->getName(Def->getOpcode());
+  bool IsVI = Name.starts_with("PseudoVMV_V_I_");
+  bool IsVX = Name.starts_with("PseudoVMV_V_X_");
+  if ((!IsVI && !IsVX) || Name.contains("MASK") ||
+      Def->getNumExplicitDefs() != 1 || Def->getNumExplicitOperands() < 4 ||
+      Def->getOperand(0).getSubReg())
+    return false;
+  const MachineOperand &Passthru = Def->getOperand(1);
+  const MachineOperand &Val = Def->getOperand(2);
+  if (!Passthru.isReg() || !(Passthru.isUndef() || !Passthru.getReg()))
+    return false;
+  if (IsVI ? !(Val.isImm() && Val.getImm() == 0) : !Val.isReg())
+    return false;
+  // Its register operands (the scalar, VL) must still hold the same values.
+  for (const MachineOperand &MO : Def->explicit_uses()) {
+    if (!MO.isReg() || !MO.getReg() || MO.isUndef())
+      continue;
+    for (auto It = std::next(Def->getIterator()); It != MI.getIterator(); ++It)
+      if (It->modifiesRegister(MO.getReg(), TRI))
+        return false;
+  }
+  if (const TargetRegisterClass *RC = TII->getRegClass(Def->getDesc(), 0))
+    if (!MRI->constrainRegClass(DstReg, RC))
+      return false;
+
+  LLVM_DEBUG(dbgs() << "lowerCopy: " << MI);
+  MachineInstr *NewMI = MBB.getParent()->CloneMachineInstr(Def);
+  NewMI->getOperand(0).setReg(DstReg);
+  NewMI->getOperand(0).setIsDead(false);
+  NewMI->getOperand(1).setReg(DstReg); // undef passthru, tied to the def
+  for (MachineOperand &MO : NewMI->explicit_uses())
+    if (MO.isReg() && MO.getReg() && !MO.isUndef()) {
+      MO.setIsKill(false);
+      // Def may have been their last use.
+      if (MO.getReg().isVirtual())
+        MRI->clearKillFlags(MO.getReg());
+    }
+  NewMI->setDebugLoc(MI.getDebugLoc());
+  MBB.insert(MI.getIterator(), NewMI);
+  MI.eraseFromParent();
+  // NewMI was inserted, and MI erased, without updating SlotIndexes /
+  // LiveIntervals: LIS no longer matches the instruction list, so later code
+  // must not call into it.
+  LISValid = false;
+  return true;
 }
 
 // Locate the first non-debug use of Reg after Def in Def's block. The uses come
@@ -260,16 +375,27 @@ bool ExpandPseudos::FindFirstUseToSinkTo(
 
   // Find the first use in this block. Uses elsewhere keep the value live past
   // the block, so leave those alone.
+  MachineInstr *FirstUse = findFirstUseInBlock(MI, Reg, *MRI);
+  if (!FirstUse) {
+    LLVM_DEBUG(dbgs() << "  No first use.\n");
+    return false;
+  }
+  // Stop short of the first use by the gap that keeps it from stalling on MI
+  // (none at m4 / m8). N is the number of instructions MI passes.
+  std::optional<MachineBasicBlock::iterator> InsertPt = stallGapInsertPoint(
+      *FirstUse, &MI, minStallGap(MI, *FirstUse, *MRI, *TRI, *TII), *MRI);
   unsigned N = 0;
-  MachineInstr *FirstUse = findFirstUseInBlock(MI, Reg, *MRI, &N);
-  if (!FirstUse || &*std::next(MI.getIterator()) == FirstUse) {
-    LLVM_DEBUG(dbgs() << "  No first use, or already just before it.\n");
+  if (InsertPt)
+    for (auto It = std::next(MI.getIterator()); It != *InsertPt; ++It)
+      if (!It->isDebugInstr())
+        ++N;
+  if (!N) {
+    LLVM_DEBUG(dbgs() << "  Already within the stall gap of its first use.\n");
     return false;
   }
 
   // Nothing crossed may conflict with the registers or memory MI touches.
-  for (auto It = std::next(MI.getIterator()); It != FirstUse->getIterator();
-       ++It) {
+  for (auto It = std::next(MI.getIterator()); It != *InsertPt; ++It) {
     MachineInstr &I = *It;
     if (I.isDebugInstr())
       continue;
@@ -294,7 +420,8 @@ bool ExpandPseudos::FindFirstUseToSinkTo(
     }
   }
 
-  LLVM_DEBUG(dbgs() << "  Sink " << MI << "  before " << *FirstUse);
+  LLVM_DEBUG(dbgs() << "  Sink " << MI << "  before " << **InsertPt
+                    << "  for use " << *FirstUse);
   LLVM_DEBUG(dbgs() << "  Between: " << N << "\n");
 
   // Predict the effect on the vector register pressure and live interval
@@ -387,7 +514,7 @@ bool ExpandPseudos::FindFirstUseToSinkTo(
                     << " each, MI point " << WindowNet << " from " << NumEvents
                     << " events\n");
 
-  MBB->splice(FirstUse->getIterator(), MBB, MI.getIterator());
+  MBB->splice(*InsertPt, MBB, MI.getIterator());
   if (LISValid)
     LIS->handleMove(MI);
   for (MachineOperand &MO : MI.all_uses())
@@ -468,32 +595,28 @@ bool ExpandPseudos::FindFirstUseToSinkToGroup(
       return false;
   Register Reg = Primary.getOperand(0).getReg();
 
-  unsigned Between = 0;
-  MachineInstr *FirstUse = findFirstUseInBlock(Primary, Reg, *MRI, &Between);
+  MachineInstr *FirstUse = findFirstUseInBlock(Primary, Reg, *MRI);
   if (!FirstUse) {
     LLVM_DEBUG(dbgs() << "  First use not found.\n");
     return false;
   }
 
-  MachineBasicBlock::iterator Target = FirstUse->getIterator();
-  do {
-    --Target;
-  } while (Target->isDebugInstr());
-  if (Between <= 2){
-    LLVM_DEBUG(dbgs() << "  Already within 2 units of first use.\n");
-    return false;
-  } else {
-    LLVM_DEBUG(dbgs()<<"  Between: "<<Between<<"\n");
-  }
-
+  // The load goes as late as the stall gap to its first use allows (none at
+  // m4 / m8), the rest of the group right before it.
+  std::optional<MachineBasicBlock::iterator> InsertPt = stallGapInsertPoint(
+      *FirstUse, &Primary, minStallGap(Primary, *FirstUse, *MRI, *TRI, *TII),
+      *MRI);
   unsigned Dist = 0;
-  for (auto It = std::next(Primary.getIterator()); It != MBB->end(); ++It) {
-    if (It->isDebugInstr())
-      continue;
-    ++Dist;
-    if (It == Target)
-      break;
+  if (InsertPt)
+    for (auto It = std::next(Primary.getIterator()); It != *InsertPt; ++It)
+      if (!It->isDebugInstr())
+        ++Dist;
+  if (!Dist) {
+    LLVM_DEBUG(dbgs() << "  Already within the stall gap of its first use.\n");
+    return false;
   }
+  MachineBasicBlock::iterator Target = *InsertPt;
+  LLVM_DEBUG(dbgs() << "  Between: " << Dist << "\n");
   LLVM_DEBUG(dbgs() << "  Sink before: " << *Target);
 
   auto Overlaps = [&](Register A, Register B) {
@@ -581,33 +704,28 @@ void ExpandPseudos::ProcessInSameBlock(MachineFunction &MF) {
 
         const TargetInstrInfo *TII = MI.getParent()->getParent()->getSubtarget().getInstrInfo();
         StringRef Name = TII->getName(MI.getOpcode());
+        // Sink SinkMI's result toward its first use, once per register.
+        auto TrySink = [&](MachineInstr &SinkMI) {
+          if (!SinkRegs.insert(SinkMI.getOperand(0).getReg()).second)
+            return;
+          LLVM_DEBUG(dbgs()<<"Prepare to sink "<<SinkMI);
+          if (FindFirstUseToSinkTo(SinkMI, AllSuccessors)) {
+            LLVM_DEBUG(dbgs()<<"  Sink success.\n");
+          }
+        };
+        // A splat sinks only when its passthru (operand 1) is its own result.
         if (Name.contains("PseudoVMV_V_I")) {
           const MachineOperand &Dst = MI.getOperand(0);
           const MachineOperand &MO = MI.getOperand(1);
-          if (Dst.isReg() && MO.isReg() && Dst.getReg() == MO.getReg()) {
-            Register DstReg = Dst.getReg();
-            if (!SinkRegs.count(DstReg)) {
-              SinkRegs.insert(DstReg);
-              LLVM_DEBUG(dbgs()<<"Prepare to sink "<<MI);
-              if (FindFirstUseToSinkTo(MI, AllSuccessors)) {
-                LLVM_DEBUG(dbgs()<<"  Sink success.\n");
-              }
-            }
-          }
+          if (Dst.isReg() && MO.isReg() && Dst.getReg() == MO.getReg())
+            TrySink(MI);
         }
+        // A compare's operand 1 is its source.
         if (Name.contains("PseudoVMSLE_VI_M")) {
           const MachineOperand &Dst = MI.getOperand(0);
           const MachineOperand &Src = MI.getOperand(1);
-          if (Dst.isReg() && Src.isReg()) {
-            Register DstReg = Dst.getReg();
-            if (!SinkRegs.count(DstReg)) {
-              SinkRegs.insert(DstReg);
-              LLVM_DEBUG(dbgs()<<"Prepare to sink "<<MI);
-              if (FindFirstUseToSinkTo(MI, AllSuccessors)) {
-                LLVM_DEBUG(dbgs()<<"  Sink success.\n");
-              }
-            }
-          }
+          if (Dst.isReg() && Src.isReg())
+            TrySink(MI);
         }
         if (Name.contains("PseudoVLE32_V_M") || isWholeRegLoadName(Name)) {
           const MachineOperand &Dst = MI.getOperand(0);
@@ -618,53 +736,50 @@ void ExpandPseudos::ProcessInSameBlock(MachineFunction &MF) {
                 MI.memoperands_begin() != MI.memoperands_end()) {
               const MachineMemOperand *MMO = *MI.memoperands_begin();
               if (const Value *PtrVal = MMO->getValue()) {
-                bool ShouldSink = false;
-                if (ShouldSink) {
-                  SinkRegs.insert(DstReg);
-                  LLVM_DEBUG(dbgs()<<"Prepare to sink Group "<<MI);
-                  SmallVector<MachineInstr*, 4> InstructionsToSink;
-                  InstructionsToSink.push_back(&MI);
-                  Register LDReg = MI.getOperand(0).getReg();
-                  Register MaskReg = 0;
-                  for (MachineOperand &MO : MI.all_uses()) {
-                    if (MO.isReg() && !MO.getReg().isVirtual()) {
-                      LLVM_DEBUG(dbgs() <<"  MaskReg: " <<MO<<"\n");
-                      MaskReg = MO.getReg();
-                      break;
-                    }
+                SinkRegs.insert(DstReg);
+                LLVM_DEBUG(dbgs()<<"Prepare to sink Group "<<MI);
+                SmallVector<MachineInstr*, 4> InstructionsToSink;
+                InstructionsToSink.push_back(&MI);
+                Register LDReg = MI.getOperand(0).getReg();
+                Register MaskReg = 0;
+                for (MachineOperand &MO : MI.all_uses()) {
+                  if (MO.isReg() && !MO.getReg().isVirtual()) {
+                    LLVM_DEBUG(dbgs() <<"  MaskReg: " <<MO<<"\n");
+                    MaskReg = MO.getReg();
+                    break;
                   }
-                  if (MaskReg) {
-                    MachineInstr *MaskDef = nullptr;
-                    for (auto It = MI.getIterator(); It != MI.getParent()->begin(); --It) {
-                      MachineInstr &Candidate = *std::prev(It);
-                      //LLVM_DEBUG(dbgs() <<"  Reverse to find Mask: " <<Candidate);
-                      for (MachineOperand &DefMO : Candidate.all_defs()) {
-                        if (DefMO.isReg() && DefMO.getReg() == MaskReg) {
-                          MaskDef = &Candidate;
-                          break;
-                        }
-                      }
-                      if (MaskDef)
+                }
+                if (MaskReg) {
+                  MachineInstr *MaskDef = nullptr;
+                  for (auto It = MI.getIterator(); It != MI.getParent()->begin(); --It) {
+                    MachineInstr &Candidate = *std::prev(It);
+                    //LLVM_DEBUG(dbgs() <<"  Reverse to find Mask: " <<Candidate);
+                    for (MachineOperand &DefMO : Candidate.all_defs()) {
+                      if (DefMO.isReg() && DefMO.getReg() == MaskReg) {
+                        MaskDef = &Candidate;
                         break;
+                      }
                     }
-                    StringRef Name = TII->getName(MaskDef->getOpcode());
-                    if (MaskDef && Name.contains("COPY")) {
-                      LLVM_DEBUG(dbgs() <<"  Mask: " <<*MaskDef);
-                      InstructionsToSink.push_back(MaskDef);
-                    }
-                  }
-                  for (MachineInstr &UseMI : MRI->def_instructions(LDReg)) {
-                    if (&UseMI == &MI) continue;
-                    StringRef Name = TII->getName(UseMI.getOpcode());
-                    if (Name.contains("PseudoVMV_V_I_M8")) {
-                      LLVM_DEBUG(dbgs() <<"  VMV setup: " <<UseMI);
-                      InstructionsToSink.push_back(&UseMI);
+                    if (MaskDef)
                       break;
-                    }
                   }
-                  if (FindFirstUseToSinkToGroup(InstructionsToSink, AllSuccessors)) {
-                    LLVM_DEBUG(dbgs()<<"  Sink Group to first use success.\n");
+                  if (MaskDef &&
+                      TII->getName(MaskDef->getOpcode()).contains("COPY")) {
+                    LLVM_DEBUG(dbgs() <<"  Mask: " <<*MaskDef);
+                    InstructionsToSink.push_back(MaskDef);
                   }
+                }
+                for (MachineInstr &UseMI : MRI->def_instructions(LDReg)) {
+                  if (&UseMI == &MI) continue;
+                  StringRef Name = TII->getName(UseMI.getOpcode());
+                  if (Name.contains("PseudoVMV_V_I")) {
+                    LLVM_DEBUG(dbgs() <<"  VMV setup: " <<UseMI);
+                    InstructionsToSink.push_back(&UseMI);
+                    break;
+                  }
+                }
+                if (FindFirstUseToSinkToGroup(InstructionsToSink, AllSuccessors)) {
+                  LLVM_DEBUG(dbgs()<<"  Sink Group to first use success.\n");
                 }
               }
             }
@@ -678,6 +793,125 @@ void ExpandPseudos::ProcessInSameBlock(MachineFunction &MF) {
   }
 }
 
+static std::optional<unsigned> findPseudo(const TargetInstrInfo *TII,
+                                          const Twine &Name);
+
+// Turn
+//   %id = PseudoVID_V_<L> undef, VL, SEW
+//   %a  = PseudoVADD_VX_<L> undef, %id, %s1, VL, SEW   ; or a disjoint VOR_VX
+//   %b  = PseudoVADD_VX_<L> undef, %a, %s2, VL, SEW
+//   %m  = PseudoVMSLT_VX_<L> %b, %n, VL, SEW
+// into
+//   %t1 = SUB %n, %s2
+//   %t2 = SUB %t1, %s1
+//   %m  = PseudoVMSLT_VX_<L> %id, %t2, VL, SEW
+// and erase the chain once it is dead. This assumes the index arithmetic does
+// not overflow SEW, as Triton offsets do not; a disjoint OR is exactly an add.
+// Only done when %b has no other use, so the chain really goes away and only
+// %id stays live.
+bool ExpandPseudos::ProcessThreshold(MachineFunction &MF) {
+  bool Changed = false;
+  for (MachineBasicBlock &MBB : MF) {
+    bool BlockChanged = false;
+    for (MachineInstr &MI : llvm::make_early_inc_range(MBB)) {
+      StringRef Name = TII->getName(MI.getOpcode());
+      if (!Name.consume_front("PseudoVMSLT_VX_") || Name.contains("MASK"))
+        continue;
+      std::optional<unsigned> VIDOpc = findPseudo(TII, "PseudoVID_V_" + Name);
+      std::optional<unsigned> VADDOpc =
+          findPseudo(TII, "PseudoVADD_VX_" + Name);
+      std::optional<unsigned> VOROpc = findPseudo(TII, "PseudoVOR_VX_" + Name);
+      if (!VIDOpc || !VADDOpc || !VOROpc)
+        continue;
+      const MachineOperand &VL = MI.getOperand(3);
+      int64_t SEW = MI.getOperand(4).getImm();
+      auto SameVL = [&](const MachineOperand &Op) {
+        return VL.isImm() ? Op.isImm() && Op.getImm() == VL.getImm()
+                          : Op.isReg() && Op.getReg() == VL.getReg();
+      };
+      auto UsableScalar = [](const MachineOperand &Op) {
+        return Op.isReg() &&
+               (Op.getReg().isVirtual() || Op.getReg() == RISCV::X0);
+      };
+      // Whether R is used other than by Except and by its def's own tied
+      // undef passthru.
+      auto UsedElsewhere = [&](Register R, const MachineInstr *Except) {
+        for (const MachineInstr &U : MRI->use_nodbg_instructions(R))
+          if (&U != Except && !U.modifiesRegister(R, TRI))
+            return true;
+        return false;
+      };
+      Register Head = MI.getOperand(1).getReg();
+      const MachineOperand &N = MI.getOperand(2);
+      if (!Head.isVirtual() || UsedElsewhere(Head, &MI) || !UsableScalar(N))
+        continue;
+      // Walk from the compare up to the vid.v, collecting the scalar offsets.
+      SmallVector<MachineInstr *, 4> Chain;
+      SmallVector<Register, 4> Offsets;
+      MachineInstr *VID = nullptr;
+      for (Register R = Head; R.isVirtual();) {
+        MachineInstr *Def = MRI->getUniqueVRegDef(R);
+        if (!Def)
+          break;
+        unsigned Opc = Def->getOpcode();
+        if (Opc == *VIDOpc) {
+          if (SameVL(Def->getOperand(2)) && Def->getOperand(3).getImm() == SEW)
+            VID = Def;
+          break;
+        }
+        if (!(Opc == *VADDOpc ||
+              (Opc == *VOROpc && Def->getFlag(MachineInstr::Disjoint))))
+          break;
+        const MachineOperand &Pass = Def->getOperand(1);
+        if ((Pass.isReg() && Pass.getReg() && !Pass.isUndef()) ||
+            !SameVL(Def->getOperand(4)) || Def->getOperand(5).getImm() != SEW ||
+            !UsableScalar(Def->getOperand(3)))
+          break;
+        Chain.push_back(Def);
+        Offsets.push_back(Def->getOperand(3).getReg());
+        R = Def->getOperand(2).getReg();
+      }
+      if (!VID || Chain.empty())
+        continue;
+      LLVM_DEBUG(dbgs() << "Threshold: " << MI);
+      // n - s_k - ... - s_1, right before the compare.
+      Register T = N.getReg();
+      for (Register Off : Offsets) {
+        Register NewT = MRI->createVirtualRegister(&RISCV::GPRRegClass);
+        BuildMI(MBB, MI, MI.getDebugLoc(), TII->get(RISCV::SUB), NewT)
+            .addReg(T)
+            .addReg(Off);
+        T = NewT;
+      }
+      // The offsets, n and the vid.v are now used later than before.
+      for (Register Off : Offsets)
+        if (Off.isVirtual())
+          MRI->clearKillFlags(Off);
+      if (N.getReg().isVirtual())
+        MRI->clearKillFlags(N.getReg());
+      MRI->clearKillFlags(VID->getOperand(0).getReg());
+      MI.getOperand(1).setReg(VID->getOperand(0).getReg());
+      MI.getOperand(2).setReg(T);
+      MI.getOperand(2).setIsKill(false);
+      // Erase the chain from the compare up while it is dead.
+      for (MachineInstr *Def : Chain) {
+        if (UsedElsewhere(Def->getOperand(0).getReg(), nullptr))
+          break;
+        Def->eraseFromParent();
+      }
+      LLVM_DEBUG(dbgs() << "  Threshold VMSLT: " << MI);
+      BlockChanged = true;
+    }
+    if (BlockChanged) {
+      computeBlockUsage(MBB);
+      Changed = true;
+    }
+  }
+  if (Changed)
+    LISValid = false;
+  return Changed;
+}
+
 void ExpandPseudos::ProcessInSameAffine(MachineFunction &MF) {
   for (auto &MBB : MF) {
     LLVM_DEBUG(dbgs() << "ProcessInSameAffine.\n");
@@ -685,22 +919,31 @@ void ExpandPseudos::ProcessInSameAffine(MachineFunction &MF) {
       MachineInstr &MI = *I;
       LLVM_DEBUG(dbgs() << MI);
       const TargetInstrInfo *TII = MI.getParent()->getParent()->getSubtarget().getInstrInfo();
-      if (MI.getOpcode() == RISCV::PseudoVID_V_M8) {
+      // vid.v at any LMUL; its partners below must have the same LMUL.
+      StringRef VIDName = TII->getName(MI.getOpcode());
+      if (VIDName.consume_front("PseudoVID_V_") && !VIDName.contains("MASK") &&
+          MI.getOperand(2).isReg()) {
+        std::optional<unsigned> VOROpc =
+            findPseudo(TII, "PseudoVOR_VX_" + VIDName);
+        std::optional<unsigned> VADDOpc =
+            findPseudo(TII, "PseudoVADD_VX_" + VIDName);
+        std::optional<unsigned> VMSLTOpc =
+            findPseudo(TII, "PseudoVMSLT_VX_" + VIDName);
+        if (!VOROpc || !VADDOpc || !VMSLTOpc)
+          continue;
         MachineOperand &VIDDest = MI.getOperand(0);
-        MachineOperand &VIDVL = MI.getOperand(2);
         MachineInstr *VOR_Orig = nullptr;
         Register VIDReg = VIDDest.getReg();
-        Register VLReg = VIDVL.getReg();
         SmallVector<MachineInstr *, 8> Uses;
         for (MachineInstr &UseMI : MRI->use_instructions(VIDReg)) {
           if (&UseMI == &MI) continue;
-          if (UseMI.getOpcode() == RISCV::PseudoVOR_VX_M8) {
+          if (UseMI.getOpcode() == *VOROpc) {
             MachineOperand &SrcReg = UseMI.getOperand(2);
             if (SrcReg.isReg() && SrcReg.getReg() == VIDReg) {
               LLVM_DEBUG(dbgs() <<"  VOR_Orig: " <<UseMI);
               VOR_Orig = &UseMI;
             }
-          } else if (UseMI.getOpcode() == RISCV::PseudoVADD_VX_M8) {
+          } else if (UseMI.getOpcode() == *VADDOpc) {
             MachineOperand &SrcReg = UseMI.getOperand(2);
             if (SrcReg.isReg() && SrcReg.getReg() == VIDReg) {
               LLVM_DEBUG(dbgs() <<"  Use VID result: " <<UseMI);
@@ -757,7 +1000,7 @@ void ExpandPseudos::ProcessInSameAffine(MachineFunction &MF) {
             MachineInstr *VOR_ForVADD = nullptr;
             Register VADDDest = VADD->getOperand(0).getReg();
             for (MachineInstr &DestMI : MRI->use_instructions(VADDDest)) {
-              if (DestMI.getOpcode() == RISCV::PseudoVOR_VX_M8) {
+              if (DestMI.getOpcode() == *VOROpc) {
                 MachineOperand &SrcReg = DestMI.getOperand(2);
                 if (SrcReg.isReg() && SrcReg.getReg() == VADDDest) {
                   LLVM_DEBUG(dbgs() <<"  VOR_ForVADD: " <<DestMI);
@@ -771,21 +1014,22 @@ void ExpandPseudos::ProcessInSameAffine(MachineFunction &MF) {
             MachineInstr *NewVADD = nullptr;
             auto CreateNewVADD = [&](MachineInstr *OldVOR, MachineInstr *OldVADD) -> MachineInstr * {
               MachineInstrBuilder MIB = BuildMI(MBB, *OldVOR, OldVOR->getDebugLoc(),
-                                                TII->get(RISCV::PseudoVADD_VX_M8));
+                                                TII->get(*VADDOpc));
               MIB.addReg(OldVOR->getOperand(0).getReg(), RegState::Define);
               MIB.addReg(OldVOR->getOperand(1).getReg(), RegState::Undef);
               MIB.addReg(BaseReg);
               MIB.addReg(OldVADD->getOperand(3).getReg());
-              MIB.addReg(VLReg);
-              MIB.addImm(5);
-              MIB.addImm(1);
+              // VL, SEW and policy of the VOR it replaces.
+              for (unsigned I = 4, E = OldVOR->getNumExplicitOperands(); I != E;
+                   ++I)
+                MIB.add(OldVOR->getOperand(I));
               MIB.copyImplicitOps(*OldVOR);
               return MIB;
             };
             NewVADD = CreateNewVADD(VOR_ForVADD, VADD);
             Register VORDest = VOR_ForVADD->getOperand(0).getReg();
             for (auto &DestMI : MRI->use_instructions(VORDest)) {
-              if (DestMI.getOpcode() == RISCV::PseudoVMSLT_VX_M8) {
+              if (DestMI.getOpcode() == *VMSLTOpc) {
                 MachineOperand &SrcReg = DestMI.getOperand(1);
                 if (SrcReg.isReg() && SrcReg.getReg() == VORDest) {
                   LLVM_DEBUG(dbgs() <<"  VMSLT: " <<DestMI);
@@ -1050,12 +1294,15 @@ bool ExpandPseudos::ProcessRematLoads(MachineFunction &MF) {
       if (Hazard)
         continue;
 
-      // Insert one non-debug instruction before the target so the clone has
-      // some distance to the use: remat, another instr, use.
-      MachineBasicBlock::iterator InsertPt(Target);
-      do {
-        --InsertPt;
-      } while (InsertPt->isDebugInstr());
+      // Insert the clone as late as the stall gap to the use allows (directly
+      // before it at m4 / m8), but after the previous use, so the value keeps
+      // its hole.
+      std::optional<MachineBasicBlock::iterator> GapPt = stallGapInsertPoint(
+          *Target, PrevUse, minStallGap(*Cand, *Target, *MRI, *TRI, *TII),
+          *MRI);
+      if (!GapPt)
+        continue;
+      MachineBasicBlock::iterator InsertPt = *GapPt;
 
       // Only worth it if every input is live at the insertion point anyway.
       bool AllLive = true;
@@ -2589,6 +2836,30 @@ bool ExpandPseudos::ProcessReverseRematChain(MachineFunction &MF) {
             }))
           return;
 
+        // The latest site the stall gap to U2 allows (U2 itself at m4 / m8):
+        // the rebuild writes v right before Instrs[PGap].
+        MachineInstr &Consumer = *BM.Instrs[U2];
+        unsigned DstLMul = pseudoLMul(DstDesc);
+        StallGap Need = minStallGap(
+            DstLMul ? DstLMul : Weight(V), DstDesc.mayLoad(),
+            Consumer.mayStore(),
+            isIntMulName(TII->getName(Plan.dstOpcode())) ||
+                isIntMulName(TII->getName(Consumer.getOpcode())));
+        LLVM_DEBUG(dbgs() << "  Stall gap: LMUL "
+                          << (DstLMul ? DstLMul : Weight(V)) << ", "
+                          << (DstDesc.mayLoad() ? "L" : "C")
+                          << (Consumer.mayStore() ? "S" : "C") << ", need "
+                          << Need.Vec << " vector / " << Need.Scalar
+                          << " scalar, rebuild "
+                          << TII->getName(Plan.dstOpcode()) << "\n");
+        unsigned PGap = U2, GapVec = 0, GapScalar = 0;
+        while (!coversStallGap(Need, GapVec, GapScalar)) {
+          if (PGap <= U1 + 1)
+            return;
+          --PGap;
+          ++(isVectorInstr(*BM.Instrs[PGap], *MRI) ? GapVec : GapScalar);
+        }
+
         SmallVector<Alt, 4> Alts[2];
         assert(Plan.Ins.size() <= 2);
         for (unsigned I = 0, E = Plan.Ins.size(); I != E; ++I) {
@@ -2650,9 +2921,9 @@ bool ExpandPseudos::ProcessReverseRematChain(MachineFunction &MF) {
             Plan.Ins.size() > 1 ? ArrayRef<Alt>(Alts[1]) : ArrayRef<Alt>(None);
         for (const Alt &A0 : Alts[0]) {
           for (const Alt &A1 : Second) {
-            // One instruction before U2, as -custom-remat, or right after
-            // the last use of a vector input if that is earlier.
-            unsigned P = U2 - 1;
+            // As close to U2 as the stall gap allows, as -custom-remat, or
+            // right after the last use of a vector input if that is earlier.
+            unsigned P = PGap;
             for (const Alt *A : {&A0, &A1})
               if (A->Last != Model::Inf)
                 P = std::min(P, A->Last + 1);
@@ -3294,6 +3565,8 @@ bool ExpandPseudos::runProcess(MachineFunction &MF) {
   if (a) {
     ProcessInSameAffine(MF);
   }
+  if (Thresh)
+    EverMadeChange |= ProcessThreshold(MF);
 
   for (auto I : RegsToClearKillFlags)
     MRI->clearKillFlags(I);
@@ -3311,27 +3584,33 @@ bool ExpandPseudos::runOnMachineFunction(MachineFunction &MF) {
   TRI = STI->getRegisterInfo();
   MRI = &MF.getRegInfo();
 
-  if (!Sink && !a && !Remat && !Reverse) {
+  bool AnyFlag = Sink || a || Thresh || Remat || Reverse || Copy;
+  if (!AnyFlag) {
     dbgs()<<"Custom Sink disabled.\n";
-    // Still report the vector register usage of every function when
-    // debugging, without transforming anything.
-    computeVectorRegUsage(MF, getAnalysis<LiveIntervalsWrapperPass>().getLIS());
+  } else if (Sink) {
+    std::string option = "";
+    if (Sink) option += " Sink";
+    if (Copy) option += " Copy";
+    if (Remat || Reverse) option += " Remat";
+    if (a) option += " Affine";
+    if (Thresh) option += " Thresh";
+    if (Reverse) option += " Reverse";
+    dbgs()<<"Custom"<< option <<" enabled.\n";
+  }
+
+  computeVectorRegUsage(MF, getAnalysis<LiveIntervalsWrapperPass>().getLIS());
+
+  // Without a -custom-* flag the pass changes nothing: a true baseline. It
+  // only reports the vector register usage when debugging.
+  if (!AnyFlag) {
     LLVM_DEBUG({
       auto [MaxRP, SLIL] = computeCurrentUsage();
       dbgs() << "Vector register usage: max VP " << MaxRP
              << ", SLIL " << SLIL << "\n";
     });
     return false;
-  } else if (Sink) {
-    std::string option = "";
-    if (Sink) option += " Sink";
-    if (Remat || Reverse) option += " Remat";
-    if (a) option += " Affine";
-    if (Reverse) option += " Reverse";
-    dbgs()<<"Custom"<< option <<" enabled.\n";
   }
 
-  computeVectorRegUsage(MF, getAnalysis<LiveIntervalsWrapperPass>().getLIS());
   LLVM_DEBUG({
     auto [MaxRP, SLIL] = computeCurrentUsage();
     dbgs() << "Before transforms: max VP " << MaxRP
@@ -3340,6 +3619,8 @@ bool ExpandPseudos::runOnMachineFunction(MachineFunction &MF) {
 
   bool MadeChange = false;
 
+  // Pseudo expansions run whenever a -custom-* flag is set; the COPY-to-VMV
+  // lowering only with -custom-copy.
   for (MachineBasicBlock &MBB : MF) {
     for (MachineInstr &MI : llvm::make_early_inc_range(MBB)) {
       // Only expand pseudos.
@@ -3359,8 +3640,8 @@ bool ExpandPseudos::runOnMachineFunction(MachineFunction &MF) {
       //  MadeChange |= LowerSubregToReg(&MI);
       //  break;
       case TargetOpcode::COPY:
-        MadeChange = LowerCopy(MBB, MI);
-        if (MadeChange) {
+        if (Copy && LowerCopy(MBB, MI)) {
+          MadeChange = true;
           LLVM_DEBUG(dbgs()<<"lowerCopy success.\n");
         }
         break;
@@ -3372,6 +3653,10 @@ bool ExpandPseudos::runOnMachineFunction(MachineFunction &MF) {
       }
     }
   }
+  // The usage the transforms start from includes the lowered copies.
+  if (MadeChange)
+    for (MachineBasicBlock &MBB : MF)
+      computeBlockUsage(MBB);
 
   MadeChange |= runProcess(MF);
 

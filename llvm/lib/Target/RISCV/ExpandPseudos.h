@@ -138,6 +138,7 @@ private:
   bool ProcessReverseRematChain(MachineFunction &MF);
   void ProcessInSameBlock(MachineFunction &MF);
   void ProcessInSameAffine(MachineFunction &MF);
+  bool ProcessThreshold(MachineFunction &MF);
   bool runProcess(MachineFunction &MF);
   bool LowerCopy(MachineBasicBlock &MBB, MachineInstr &MI);
 };

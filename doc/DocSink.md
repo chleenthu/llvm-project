@@ -73,7 +73,7 @@ $v0 = COPY %33
 
 # Expand-Pseudos COPY-to-VMV Optimization
 
-This phase runs before the sink diagnostics.  `LowerCopy` removes a redundant virtual vector `COPY` by recreating its VMV producer directly in the COPY destination.
+This phase runs before the sink diagnostics, only with the hidden `--custom-copy` option (without any `--custom-*` flag the pass changes nothing).  `LowerCopy` removes a redundant virtual vector `COPY` by recreating its VMV producer directly in the COPY destination.
 
 ## Intended pattern
 
