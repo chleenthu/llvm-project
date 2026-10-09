@@ -121,22 +121,7 @@ The previous version searched every gap of every value for the one with the larg
 
 ### Results
 
-`llc -O3 -verify-machineinstrs` on the `dump2/base` `.llir` kernels. Max VP and SLIL are the pass's own LMUL-weighted numbers before and after its transforms (32 vector registers). Spills and reloads are `Folded Spill` / `Folded Reload` in the assembly.
-
-`--custom-remat` fires nothing on these kernels (they only have masked loads, and the compares it could recompute have inputs that die early), so its column is the baseline every flag starts from: the COPY lowering that runs whenever any `--custom-*` flag is set.
-
-| kernel | none: spills / reloads | `--custom-remat` (baseline): spills / reloads | `--custom-reverse`: max VP | SLIL | spills / reloads | fires |
-|---|---|---|---|---|---|---|
-| `reverse_v1` | 19 / 26 | 16 / 22 | 84 → 84 | 2785 → 2857 | 16 / 20 | 2 elementwise |
-| `reverse_v2` | 15 / 17 | 15 / 17 | 75 → 67 | 3061 → 2899 | **9 / 9** | 8 elementwise |
-| `reverse_v3` | 18 / 21 | 17 / 22 | 108 → 92 | 3575 → 3875 | **14 / 18** | 4 direct (2- and 3-step) |
-| `reverse_v4` | 26 / 27 | 23 / 25 | 140 → 92 | 4316 → 4896 | **18 / 23** | 6 direct (2- and 3-step) |
-
-The former `--custom-forward` reached 14 / 18 on `reverse_v3` and 19 / 24 on `reverse_v4`. The multi-step direct options reproduce the first and do slightly better on the second, because they can also replay the multiply (3 steps). Before the direct options were extended, `--custom-reverse` fired nothing on `reverse_v3` and `reverse_v4`: their direct options were single-step and their inputs dead, and the multiply that follows has no inverse.
-
-On `reverse_v1`, the 2 elementwise remats free a register for only about 5 instructions, so max VP is unchanged and the small change in reloads is the register allocator reacting to slightly different live ranges.
-
-All runs pass `-verify-machineinstrs`, and `--custom-reverse` alone gives the same assembly as `--custom-reverse --custom-remat` on all four kernels. On `s279.mir` (checked with `-run-pass=expandpseudos -verify-machineinstrs`), `--custom-reverse` alone runs the redundant-reload removal and one load remat, the same MIR as `--custom-remat --custom-reverse`; no reverse remat fires there. (`llc -start-before=expandpseudos s279.mir` crashes in the RISC-V assembly printer with an invalid register even without any flag, so `s279` cannot be checked through to assembly that way.)
+Results on the `reverse_v1` to `reverse_v4` kernels (baseline vs `--custom-reverse`) are in `DocResult.md`.
 
 ## Result on the TSVC `reverse_v1` kernel (single-hop, LMUL8)
 
@@ -163,6 +148,10 @@ ReverseRematChain: recompute %41 from %134 after ...  # b2 = c2 + 3
 ```
 
 **Measured**: `grep -c "Folded Spill" reverse-v2.s` went from 14 (baseline) to **7** with `--custom-reverse` — spill sites cut in half. Predicted peak vector-register pressure (computed LIS-independently from `Usage`/`VRegLIL`, see `ExpandPseudos::computeCurrentUsage`) dropped from 76 to 40, and SLIL from 2540 to 2065.
+
+## Results on the lqcd and paper tutorials
+
+Board results for the `rvv_lqcd_*` and `rvv_paper_*` tutorials, baseline vs all flags, are in `DocResult.md`.
 
 ## Limitations
 
