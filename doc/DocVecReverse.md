@@ -4,6 +4,8 @@
 
 Both are matched in `ExpandPseudos.cpp` (`matchFlipPlan`, `matchPermPlan`) and emitted by `ProcessReverseRematChain` like any other option.
 
+Three later additions to `matchGroupPlans` are covered after the 07 results: the slide rotation in its up-first order, widening by 4 or 8, and single shifts and narrowings made reversible by known-zero bits (`srl-of-sll`, `sll-of-srl`, `zext-of-narrow`).
+
 ## How a shuffle reaches the pass
 
 A Triton `vector.shuffle` becomes an LLVM `shufflevector` and is lowered by the RISC-V backend according to its mask. For the single-source masks seen in these kernels:
@@ -131,7 +133,7 @@ Before and after the self-inverse rebuild:
 | | before | after |
 |---|---|---|
 | remats | 41, all reload a new table (5 instructions) | 41: 12 self-inverse (1 instruction), 29 reload |
-| loop instructions | 511 → 716 | 511 → 668 |
+| loop instructions | 511 -> 716 | 511 -> 668 |
 | new constant-pool tables | 41 | 29 |
 
 The 12 self-inverse sites are those where the index table is still read by a later row's gather. At the other 29 the index has died, and reusing it would extend it, so the reload plan is used there.
@@ -147,11 +149,167 @@ The BF16 kernel truncates every product and every tree step to BF16 (`vand` with
 
 `--custom-reverse` is still about 20% slower on 07: freeing an LMUL-8 value for 11 instructions does not pay for the 29 remaining 5-instruction reloads. The gap rule has no cost model (see Limitations).
 
+## Slide rotation, up-first order
+
+`inverse-slide-rotation` first matched only the order LLVM emits for a rotation shuffle, slide down then up. It now also matches the reverse order:
+
+```text
+r = vslideup.v[ix]    undef, v, k        ; VL n: lanes k..n-1 = v[0..n-k-1]
+y = vslidedown.v[ix]  r(tied), v, n-k    ; VL k, tail undisturbed: lanes 0..k-1 = v[n-k..n-1]
+```
+
+This rotates `v` by `n-k`, so the inverse is the rotation by `k`. The matcher requires `0 < k < n`, both constant, the slidedown's VL equal to `k`, its policy tail undisturbed (otherwise lanes `k..n-1` are agnostic), the same SEW and LMUL, and no def of `v` between the two slides.
+
+The rebuild is always emitted down then up, both at the slideup's VL `n`, so it needs no `vsetvli` change:
+
+| forward order | rebuild |
+|---|---|
+| `vslidedown k` ; `vslideup n-k` | `vslidedown y, n-k` ; `vslideup y, k` |
+| `vslideup k` ; `vslidedown n-k` at VL `k` | `vslidedown y, k` ; `vslideup y, n-k` |
+
+LLVM's shuffle lowering only emits the down-first order (`isMaskedSlidePair` in `RISCVISelLowering.cpp` puts the `vslideup` second), so the up-first form comes from intrinsics or from other passes.
+
+Test `~/tsvc/rot_up_down.ll` (64 x i32, LMUL 8, `k = 24`; `y` feeds four products and `v` is used again after them), `llc --custom-reverse -verify-machineinstrs`:
+
+| flags | spills | reloads |
+|---|---|---|
+| none | 7 | 7 |
+| `--custom-reverse` | **4** | **4** |
+
+```text
+vslideup.vi    v8, v16, 24
+vsetivli       zero, 24, e32, m8, tu, ma
+vslidedown.vx  v8, v16, a0          ; a0 = 40: y = rotr(v, 24)
+...
+vslidedown.vi  v24, v8, 24          ; at VL 64
+vslideup.vx    v24, v8, a0          ; v' = rotl(y, 24)
+```
+
+`~/tsvc/rot_down_up.ll` is the same kernel in the down-first order; it still fires. Neither has been run on QEMU or the board.
+
+## Widen by 4 or 8 (`narrow-of-widen`)
+
+`vsext.vf4` / `vzext.vf4` and `vf8` are undone like `vf2`, with one `vnsrl.wi 0` per halving of SEW, each at half the LMUL of the one before:
+
+| widen | rebuild of `v` |
+|---|---|
+| `vsext` / `vzext.vf2` at e32 m8 | `vnsrl.wi 0` at e16 m4 |
+| `vsext` / `vzext.vf4` at e32 m8 | `vnsrl.wi 0` at e16 m4, then e8 m2 |
+| `vsext` / `vzext.vf8` at e64 m8 | `vnsrl.wi 0` at e32 m4, e16 m2, then e8 m1 |
+
+Truncation drops the same bits whether the source was sign or zero extended, so both rebuild exactly. Every step but the last writes a new temporary, and the last writes `v`. If any step's pseudo does not exist (an LMUL below MF8), no plan is recorded.
+
+Test `~/tsvc/ext_narrow.ll` (`y = ext(x)` at LMUL 8 feeds four products, `x` is used again after them):
+
+| function | rebuild | spills / reloads, none | `--custom-reverse` |
+|---|---|---|---|
+| `sext_vf2` (e16 m4 → e32 m8) | 1 `vnsrl` | 4 / 4 | 3 / 3 |
+| `sext_vf4` (e8 m2 → e32 m8) | 2 `vnsrl` | 4 / 4 | 3 / 3 |
+| `zext_vf8` (e8 m1 → e64 m8) | 3 `vnsrl` | 4 / 4 | 3 / 3 |
+
+## Known-zero bits (`srl-of-sll`, `sll-of-srl`, `zext-of-narrow`)
+
+A shift left by `s` drops the top `s` bits of each element, a shift right by `s` drops the low `s` bits, and `vnsrl.wi 0` drops the upper half. None of them is reversible alone, unless the dropped bits are known to be zero. One function answers that for all three:
+
+```text
+knownZeroBits(R, Bits, VL) -> {High, Low}
+```
+
+It returns how many high and how many low bits of each of the first `VL` elements of `R` are known to be zero, viewing the elements as `Bits` wide. It looks only at `R`'s unique def, through copies, and requires that def to be unmasked, with an undef passthru, at that SEW, and to write at least `VL` elements. When either count reaches SEW, the elements are all zero and both are SEW.
+
+| def of `R` | known-zero high bits | known-zero low bits |
+|---|---|---|
+| `vzext.vfN` | `SEW - SEW/N` + source's | source's |
+| `vsext.vfN` | as `vzext` if the source's top bit is known zero, else 0 | source's |
+| `vsrl.vi/vx` by a constant `s` | source's + `s` | source's − `s` |
+| `vsra.vi/vx` by a constant `s` | source's + `s` if the source has any, else 0 | source's − `s` |
+| `vsll.vi/vx` by a constant `s` | source's − `s` | source's + `s` |
+| `vand` (`.vv`, or `.vx/.vi` by a constant) | the larger of the two operands' | the larger of the two operands' |
+| `vor` (same forms) | the smaller of the two | the smaller of the two |
+| `vmul.vv`, `vmul.vx` by a constant | 0 | the sum of the two |
+| `vmv.v.i` / `vmv.v.x` of a constant | the constant's leading zeros | the constant's trailing zeros |
+| `vnsrl.wi/wx` by a constant `s` | from bits `[s, s+SEW)` of the wide source | wide source's − `s` |
+| anything else | 0 | 0 |
+
+The three rebuilds that use it:
+
+| forward | condition | rebuild |
+|---|---|---|
+| `y = vsll.vi/vx v, s` | `High(v, SEW) >= s` | `v = vsrl y, s` (`srl-of-sll`) |
+| `y = vsrl.vi/vx v, s` or `vsra.vi/vx` | `Low(v, SEW) >= s` | `v = vsll y, s` (`sll-of-srl`) |
+| `y = vnsrl.wi v, 0` (`v` 2*SEW wide) | `High(v, 2*SEW) >= SEW` | `v = vzext.vf2 y` (`zext-of-narrow`) |
+
+`sll-of-srl` is exact for `vsra` too: whatever the right shift brings in at the top (zeros or copies of the sign bit), the shift left pushes back out, and the bits it brings in at the bottom are the ones known to be zero.
+
+`constOperand` also changed for this. Constants were only read from `li` (`ADDI $x0, imm`), but `0xffffffff` is materialized as `li -1 ; srli 32`. It now folds chains of `LUI`, `ADDI`, `ADDIW`, `SLLI` and `SRLI`. Every matcher uses `constOperand`, so this can only add matches, all of them exact.
+
+Test `~/tsvc/known_zero.ll`:
+
+| function | expected | result | spills / reloads, none → `--custom-reverse` |
+|---|---|---|---|
+| `sll_after_zext`: `vsll 8` after `vzext.vf2` | rebuild | `vsrl.vi 8` | 4 / 4 → 3 / 3 |
+| `sll_after_srl`: `vsll 4` after `vsrl 4` | rebuild | `vsrl.vi 4` | 4 / 4 → 3 / 3 |
+| `sll_after_and`: `vsll 20` after `vand 0xff` | rebuild | `vsrl.vi 20` | 4 / 4 → 3 / 3 |
+| `sll_too_far`: `vsll 17` after `vzext.vf2` (16 known) | none | none | 4 / 4 → 4 / 4 |
+| `narrow_after_zext`: `vnsrl 0` after `vzext.vf2` | rebuild | `vzext.vf2` | 0 / 0 |
+| `narrow_after_srl`: `vnsrl 0` after `vsrl 32` | rebuild | `vzext.vf2` | 0 / 0 |
+| `narrow_after_and`: `vnsrl 0` after `vand 0xffffffff` | rebuild | `vzext.vf2` | 0 / 0 |
+| `narrow_after_srl31`: `vnsrl 0` after `vsrl 31` | none | none | 0 / 0 |
+| `narrow_not_zero`: `vnsrl 0` after `vand 0x1ffffffff` | none | none | 0 / 0 |
+
+The narrow cases keep `v` at LMUL 8 and `y` at LMUL 4, which does not spill here, so they show only that the rebuild fires and is skipped where it should be.
+
+Test `~/tsvc/known_zero_low.ll`, for `sll-of-srl`:
+
+| function | expected | result | spills / reloads, none → `--custom-reverse` |
+|---|---|---|---|
+| `srl_after_sll`: `vsrl 4` after `vsll 4` | rebuild | `vsll.vi 4` | 4 / 4 → 3 / 3 |
+| `sra_after_and`: `vsra 8` after `vand -256` | rebuild | `vsll.vi 8` | 4 / 4 → 3 / 3 |
+| `srl_after_mul`: `vsrl 3` after `vmul.vx 16` (4 known) | rebuild | `vsll.vi 3` | 5 / 5 → 3 / 3 |
+| `srl_after_zext_sll`: `vsrl 8` after `vzext.vf2`, `vsll 8` | rebuild | `vsll.vi 8` | 4 / 4 → 3 / 3 |
+| `srl_too_far`: `vsrl 5` after `vsll 4` | none | none | 4 / 4 → 4 / 4 |
+| `sra_after_or`: `vsra 8` after `vsll 8`, `vor` with a load | none | none | 4 / 4 → 4 / 4 |
+
+None of these has been run on QEMU or the board.
+
+## Which Triton op can be reversed
+
+### Non-Elementwise Ops That Can Be Reversed
+
+| Group | Lowered to | Rebuild of the source | status |
+|---|---|---|---|
+| Lane rotation (slides) | `vslidedown k` ; `vslideup n-k`, or `vslideup k` ; `vslidedown n-k` at VL `k`, tail undisturbed | inverse slides at VL `n`: down `n-k`, up `k` (down `k`, up `n-k` for the up-first form) | implemented (`inverse-slide-rotation`, both orders) |
+| Bit rotation in element | `vsrl s` ; `vsll SEW-s` ; `vor` | `vsll s` ; `vsrl SEW-s` ; `vor` | implemented (`inverse-bit-rotation`) |
+| Adjacent lane-pair swap | bit rotation by 32 at e64 | the same rotation again | implemented (`inverse-bit-rotation`) |
+| Zip (interleave, `tl.join`) | `vwaddu.vv` ; `vwmaccu.vx -1` | `a = vnsrl.wi 0` ; `b = vnsrl.wx SEW` | implemented (`deinterleave-of-zip`) |
+| Unzip (`tl.split`) | `vnsrl.wi 0` ; `vnsrl.wx SEW` | `v = zip(lo, hi)`, needs both halves | implemented (`zip-of-deinterleave`) |
+| Widen | `vsext` / `vzext`, `vwcvt(u)`, `vfwcvt` | `vnsrl.wi 0` / `vfncvt(.rtz)`, per x2 step | implemented (`narrow-of-widen`), vf2 / vf4 / vf8 |
+| Flip (`tl.flip`), permutation | `vid` ; `vrsub` ; `vrgather` ; `vslidedown` | same gather again, or inverse index | implemented (`flip-of-flip`, `inverse-permutation-gather`) |
+| Self-inverse permutation (block swaps, `tl.sum` butterfly step) | `vrgatherei16.vv` by a constant index `p`, `p == inverse(p)` | the same gather with the same index (`vrgatherei16.vv y, idx`) | implemented (self-inverse) |
+| Mask to vector, widen by k | `vmerge.vim 0, -1` ; `vwadd.vx`, `vfwmul.vf` | `vmsne.vi 0` ; `narrow(y - k)`, `narrow(y / k)` | possible |
+
+### Non-Elementwise Ops That Cannot
+
+| Group | Lowered to | Why the source is lost | status |
+|---|---|---|---|
+| Slide alone | `vslideup` / `vslidedown`, `vslide1up` / `vslide1down` | k lanes fall off one end | no (the rotation pair is implemented) |
+| Narrow alone | `vnsrl`, `vnsra`, `vnclip`, `vfncvt` | drops the upper half, or rounds | no (the unzip pair is implemented) |
+| Gather with repeats, splat lane | `vrgather.vv` / `.vx` / `.vi` | several lanes read one source lane | no |
+| Compress, merge | `vcompress.vm`, `vmerge.vvm` | unselected lanes are dropped | no |
+| Reduction | `vredsum`, `vredmax`, `vfredosum`, ... | a vector becomes one scalar | no |
+| Element move | `vmv.x.s`, `vfmv.f.s`, `vmv.s.x` | only one lane is kept | no |
+| Mask ops | `vmseq`, `vmflt`, `vcpop`, `vfirst`, `viota`, `vmsbf` | many values map to one bit or count | no |
+| Widening multiply, both unknown | `vwmul.vv`, `vfwmul.vv` | a product does not fix both factors | no |
+
 ## Which RVV instructions can be reversed
 
-The tables below classify single RVV instructions. `y` is the result, `v` the value to rebuild, `K` the other source. "Implemented" refers to `ReversePatterns` / `matchReverseOp`, `matchGroupPlans`, `matchFlipPlan` and `matchPermPlan` in `ExpandPseudos.cpp`. "Possible" means the inverse exists but is not matched yet.
+The tables below classify RVV instructions in two groups. The elementwise tables hold instructions that compute lane `i` of `y` from lane `i` of the sources: arithmetic, logic, shifts, compares and conversions, including widening and narrowing, where lane `i` of the narrow vector maps to lane `i` of the wide one. The data-movement tables hold instructions that copy or select values without computing on them, or that read other lanes: copies, slides, gathers, compress, merge, scalar moves, splats, reductions and mask scans. Widening, interleave through widening arithmetic (`vwaddu` + `vwmaccu`), deinterleave through `vnsrl` and lane swaps through shift pairs change the layout, so they are listed in the data-movement tables, not in the elementwise ones.
 
-### Reversible
+`y` is the result, `v` the value to rebuild, `K` the other source. "Implemented" refers to `ReversePatterns` / `matchReverseOp`, `matchGroupPlans`, `matchFlipPlan` and `matchPermPlan` in `ExpandPseudos.cpp`. "Possible" means the inverse exists but is not matched yet.
+
+### Elementwise instructions
+
+#### Elementwise that is reversible
 
 | RVV instruction (`y = ...`) | rebuild of `v` | live at the site | exact | status |
 |---|---|---|---|---|
@@ -162,67 +320,47 @@ The tables below classify single RVV instructions. `y` is the result, `v` the va
 | `vxor.vv/vx/vi` (incl. `vnot`) | `vxor` again | y, K | exact | implemented |
 | `vfadd` / `vfsub` / `vfrsub` | inverse op | y, K | rounded | implemented |
 | `vfmul` / `vfdiv` / `vfrdiv` | inverse op | y, K | rounded | implemented |
-| `vsext.vf2` / `vzext.vf2` | `vnsrl.wi y, 0` | y | exact | implemented (`narrow-of-widen`) |
-| `vwadd(u).vx v, x0` (`vwcvt`) | `vnsrl.wi y, 0` | y | exact | implemented |
-| `vfwcvt.f.f.v` | `vfncvt.f.f.w` | y | exact | implemented |
-| `vfwcvt.f.x(u).v` | `vfncvt.rtz.x(u).f.w` | y | exact | implemented |
-| `vrgather(ei16).vv v, idx`, constant permutation | gather by the inverse table | y | exact | implemented (`inverse-permutation-gather`) |
-| same, self-inverse permutation (block swaps) | `vrgatherei16 y, idx` | y, idx | exact | implemented (self-inverse) |
-| copies (`vmv.v.v`, `vmv<N>r`, `COPY`) | same value | y | exact | equivalence class |
 | `vmul.vx v, c`, c an odd constant | `vmul.vx y, c^-1 mod 2^SEW` | y | exact | possible (integer `MUL` is never reversed today) |
 | `vmacc` / `vmadd` (`y = a * b + v`) | `vnmsac`: `v = y - a * b` | y, a, b | exact | possible (tied passthru is rejected today) |
 | `vfmacc` / `vfmadd` (accumulator `v`) | `vfnmsac` | y, a, b | rounded | possible |
 | `vwadd(u).wv/wx` (`y = v + ext(b)`, `v` wide) | `vwsub(u).wv/wx` | y, b | exact | possible |
-| `vsext` / `vzext.vf4/vf8` | 2 or 3 `vnsrl.wi 0` | y | exact | possible (only vf2 today) |
 | `vfsgnjn.vv v, v` (`vfneg`) | itself | y | exact | possible |
 | `vfmul` / `vfdiv` by a power of 2 | inverse op | y | exact without overflow / underflow | implemented as rounded |
-| Zvbb `vror` / `vrol`, `vrev8`, `vbrev` | opposite rotate / itself | y | exact | possible (Zvbb only) |
 
-### Not reversible alone
+#### Elementwise that cannot be reversed alone
 
 These instructions drop part of `v`. They become reversible only where the dropped part is still held by another value: a partner instruction's result, or a side value that is live at the site.
 
 | RVV instruction | what is lost | reversible when | status |
 |---|---|---|---|
-| `vslidedown k` | lanes 0..k-1 | paired with `vslideup n-k` of the same `v` (rotation) | implemented (`inverse-slide-rotation`) |
-| `vslideup k` | top k lanes | same rotation pair | implemented |
-| `vsrl` / `vsll` by s | low / high s bits | paired with the shift by SEW-s and `vor` / `vxor` / `vadd` (bit rotation; s = 32 at e64 swaps adjacent 32-bit lanes) | implemented (`inverse-bit-rotation`) |
-| `vsll` by s alone | high s bits | the high bits are known zero (e.g. after `vzext`): `vsrl` | possible (needs known bits) |
-| `vwaddu.vv a, b` alone | `b` is mixed in | followed by `vwmaccu.vx -1, b` (zip) | implemented (`deinterleave-of-zip`) |
-| `vnsrl.wi 0` / `vnsrl.w* SEW` | the other half | both halves exist (unzip pair): `vwaddu` + `vwmaccu` | implemented (`zip-of-deinterleave`) |
-| `vid`, `vrsub`, `vrgather` x L, `vslidedown` (lane reverse) | each step alone | the whole group replayed on `y`; idx reused if live | implemented (`flip-of-flip`) |
-| `vrgather` by a non-constant or non-permutation index (`vrgather.vi`, broadcast) | duplicated lanes / unknown inverse | the index is a constant permutation | no |
+| `vsrl` / `vsra` by s alone | low s bits | the low bits are known zero (e.g. after `vsll`, `vand` by a constant, `vmul` by an even constant): `vsll` | implemented (`sll-of-srl`, `knownZeroBits`) |
 | `vnsra`, `vnclip(u)`, `vfncvt.*`, `vfcvt.x.f`, `vfcvt.rtz.*` | high bits, rounding, saturation | - | no |
 | `vand`, `vor`, `vandn`, `vmin(u)`, `vmax(u)`, `vfmin`, `vfmax` | masked bits / losing operand | the complement is live (`v = (v & m) \| (v & ~m)`) | possible, rare |
-| `vmerge`, `vcompress`, masked ops with a live passthru | masked-off lanes | - | no |
+| mask `vmand`, `vmor`, `vmandn`, `vmorn`, `vmnor` with K | mask bits | the complement is live | no |
 | `vmul.vv`, `vmul.vx` by even or unknown K, `vmulh*`, `vdiv`, `vrem`, `vwmul` | high bits, remainder, division by zero | K an odd constant (above) | no |
 | `vsadd`, `vssub`, `vaadd`, `vasub`, `vsmul`, `vssrl`, `vssra` | saturation / rounding bit | - | no |
 | `vfsqrt`, `vfrec7`, `vfrsqrt7`, `vfabs`, `vfsgnj(x)` with K | sign / precision | - | no |
-| `vredsum`, `vredmax`, `vfred*` | lanes collapsed into one | - | no |
 | compares (`vmseq`, `vmflt`, ...) | all but one bit | - | no |
-| `vslide1up` / `vslide1down` | one lane | the lost lane is in a live scalar | possible, rare |
-| `vid`, `vmv.v.x/i`, loads | no vector source | - | not a reverse case (direct remat or RA remat) |
 
 ### Data-movement instructions
 
 #### Data movement that can be reversed
 
-| instruction or group (`y = ...`) | effect | rebuild of `v` | live at the site | status |
+| instruction or group (`y = ...`) | rebuild of `v` | live at the site | exact | status |
 |---|---|---|---|---|
-| `vmv.v.v` (same VL), `vmv1r/2r/4r/8r.v`, `vmmv.m` (`vmand.mm m, m`), `COPY`, a whole `INSERT_SUBREG` / `REG_SEQUENCE` operand | copy | `y` itself | y | equivalence class |
-| `vrgather.vv` / `vrgatherei16.vv v, idx`, idx a constant permutation `p` | `y[i] = v[p[i]]` | gather `y` by `q` (new table) | y | implemented (`inverse-permutation-gather`) |
-| same, `p == q` (block swaps, neighbour swaps, byte swap through an e8 gather) | self-inverse | `vrgatherei16 y, idx` | y, idx | implemented (self-inverse) |
-| `vid`, `vrsub`, `vrgather.vv` x L, `vslidedown` | lane reverse | the same group on `y` | y (idx if live) | implemented (`flip-of-flip`) |
-| `vslidedown k` + `vslideup n-k` of the same `v` | rotation by `k` | rotation by `n-k` | y | implemented (`inverse-slide-rotation`) |
-| `vslideup.vx/vi P, v, k` (tied passthru), `v`'s VL at most VLMAX - k | subvector insert at `k` (`tl.cat`) | `vslidedown y, k` at `v`'s VL | y | possible |
-| `vsll s` + `vsrl SEW-s` + `vor` / `vxor` / `vadd` | bit rotation by `s` (no Zvbb `vror` on the board) | opposite rotation | y | implemented (`inverse-bit-rotation`) |
-| `vsext` / `vzext.vf2`, `vwcvt(u).x.x.v` (`vwadd(u).vx v, x0`) | widen each lane | `vnsrl.wi y, 0` (`vncvt.x.x.w`) | y | implemented |
-| `vsext` / `vzext.vf4` / `vf8` | widen each lane 4x / 8x | 2 or 3 `vnsrl.wi 0` | y | possible |
-| `vfwcvt.f.f.v` (f16 to f32 with Zvfh, f32 to f64) | widen each lane | `vfncvt.f.f.w` | y | implemented |
-| `vwaddu.vv a, b` + `vwmaccu.vx -1, b` | zip `a`, `b` into wide lanes | `vnsrl.wi y, 0` / `vnsrl.wi y, SEW` | y | implemented (`deinterleave-of-zip`) |
-| `vnsrl.wi w, 0` + `vnsrl.wi w, SEW` | unzip `w` into both halves | `vwaddu` + `vwmaccu` | both halves | implemented (`zip-of-deinterleave`) |
-| `y = vcompress v, m` + `z = vcompress v, ~m` | split `v` by `m` | `vrgather z, viota(~m)`, then `vrgather y, viota(m)` masked by `m` into it | y, z, m | possible (about 5 instructions) |
-| `vmnot.m` (`vmnand.mm m, m`) | mask not | itself | y | possible (masks are one register) |
+| `vsext.vf2` / `vzext.vf2` | `vnsrl.wi y, 0` | y | exact | implemented (`narrow-of-widen`) |
+| `vwcvt(u).x.x.v` (`vwadd(u).vx v, x0`) | `vnsrl.wi y, 0` | y | exact | implemented |
+| `vfwcvt.f.f.v` | `vfncvt.f.f.w` | y | exact | implemented |
+| `vfwcvt.f.x(u).v` | `vfncvt.rtz.x(u).f.w` | y | exact | implemented |
+| `vrgather(ei16).vv v, idx`, constant permutation | gather by the inverse table | y | exact | implemented (`inverse-permutation-gather`) |
+| same, self-inverse permutation (block swaps) | `vrgatherei16 y, idx` | y, idx | exact | implemented (self-inverse) |
+| copies (`vmv.v.v`, `vmv<N>r`, `COPY`) | same value | y | exact | equivalence class |
+| `vslideup.vx/vi P, v, k` (tied passthru), `v`'s VL at most VLMAX - k | `vslidedown y, k` at `v`'s VL | y | exact | possible |
+| `vsext` / `vzext.vf4/vf8` | 2 or 3 `vnsrl.wi 0` | y | exact | implemented (`narrow-of-widen`) |
+| `vwaddu.vv a, b` + `vwmaccu.vx -1, b` | `vnsrl.wi y, 0` / `vnsrl.wi y, SEW` | y | exact | implemented (`deinterleave-of-zip`) |
+| `vnsrl.wi w, 0` + `vnsrl.wi w, SEW` | `vwaddu` + `vwmaccu` | both halves | exact | implemented (`zip-of-deinterleave`) |
+| `y = vcompress v, m` + `z = vcompress v, ~m` | `vrgather z, viota(~m)`, then `vrgather y, viota(m)` masked by `m` into it | y, z, m | exact | possible (about 5 instructions) |
+| `vmnot.m` (`vmnand.mm m, m`) | itself | y | exact | possible (masks are one register) |
 
 #### Data movement that cannot be reversed alone
 
@@ -238,30 +376,19 @@ These instructions drop part of `v`. They become reversible only where the dropp
 | `vrgather.vv` / `vrgatherei16.vv` by a constant non-permutation (repeated or missing lanes; an index of VLMAX or more gives 0) | lanes not selected | - | no |
 | `vrgather.vv` / `vrgatherei16.vv` by a computed index | unknown permutation | - | no |
 | `vrgather.vx` / `vrgather.vi` | all lanes but one (splat) | - | no |
-| `vcompress.vm` alone | lanes where `m` is 0 | the complementary compress is live (first table) | possible |
+| `vcompress.vm` alone | lanes where `m` is 0 | the complementary compress is live (previous table) | possible |
 | `vmerge.vvm` / `vxm` / `vim`, `vfmerge.vfm` (`vselect`) | lanes of `v` replaced by the other source | the replaced lanes are live in another value (a second `vmerge`) | no, rare |
+| `vsll` by s alone | high s bits | the high bits are known zero (e.g. after `vzext`, `vsrl`, `vand` by a constant): `vsrl` | implemented (`srl-of-sll`) |
+| `vnsrl.wi 0` alone | high bits | the high bits are known zero (e.g. after `vzext.vf2`, `vsrl`, `vand` by `2^SEW - 1`): `vzext.vf2` | implemented (`zext-of-narrow`) |
+| `vwaddu.vv a, b` alone | `b` is mixed in | followed by `vwmaccu.vx -1, b` (zip) | implemented (`deinterleave-of-zip`) |
 | `vnsrl.wi 0` / `vnsrl.wi SEW` alone | the other half | the partner is live (first table) | implemented as a pair only |
 | `vmv.v.v` with a smaller VL and tail undisturbed (`PseudoVMV_V_V` with a passthru) | lanes from VL on | the tail of `v` is not demanded | no |
 | `EXTRACT_SUBREG` of one part of `v` (also tuple extract after `vlseg`) | the other parts | all parts are live: `REG_SEQUENCE` | possible |
-| any instruction of the first table, masked (`v0.t`) or tail undisturbed | inactive / tail lanes take the passthru | those lanes of `v` are not demanded | no |
-| `vsll` / `vsrl` / `vsra` / `vnsra` by `s` alone | high / low bits | the partner shift exists (rotation), or the lost bits are known | rotation implemented |
+| any reversible instruction (either table), masked (`v0.t`) or tail undisturbed | inactive / tail lanes take the passthru | those lanes of `v` are not demanded | no |
+| `vsll` / `vsrl` / `vsra` / `vnsra` by `s` alone | high / low bits | the partner shift exists (rotation), or the lost bits are known | rotation implemented; `vsll` with known-zero high bits and `vsrl` / `vsra` with known-zero low bits implemented |
 | `vredsum`, `vredmax(u)`, `vredmin(u)`, `vredand/or/xor`, `vfred*`, `vwred*` | lanes collapsed into one | - | no |
 | `viota.m`, `vmsbf.m`, `vmsif.m`, `vmsof.m`, `vcpop.m`, `vfirst.m` | mask turned into a count or a prefix | - | no |
 | `vmv.v.x` / `vmv.v.i`, `vfmv.v.f`, `vid.v`, `vmset.m` / `vmclr.m`, `PseudoClearVR` | no vector source | - | not a reverse case (direct remat) |
-| loads: `vle`, `vle*ff`, `vlse`, `vluxei` / `vloxei`, `vlseg` / `vlsseg` / `vluxseg` / `vloxseg`, `vl<N>re<eew>`, `vlm.v`, `PseudoVRELOAD` | data comes from memory | - | not a reverse case (direct or RA remat while memory is unchanged) |
-| stores: `vse`, `vsse`, `vsuxei` / `vsoxei`, `vsseg` / ..., `vs<N>r`, `vsm.v`, `PseudoVSPILL` | no vector result | - | not a reverse case |
-
-The two tables above cover only the RVV instructions that move data without computing on it: lane permutations (gathers, slides, compress, merge), lane-width reshapes, scalar-lane moves, register and mask copies. They are limited to instructions that execute on the BPI-F3 (SpacemiT X60, `rv64imafdcv_..._zvfh_zvfhmin_zvkt`). Each listed instruction was run on the board under a SIGILL handler, at a SEW where its encoding is legal.
-
-The tablegen files read for the list are `RISCVInstrInfoV.td`, `RISCVInstrInfoVPseudos.td`, `RISCVInstrInfoVSDPatterns.td`, `RISCVInstrInfoVVLPatterns.td` and every other vector `.td` in `llvm/lib/Target/RISCV`. Data-movement instructions defined there but left out because the board does not run them:
-
-| extension | instructions | on the BPI-F3 |
-|---|---|---|
-| Zvbb / Zvkb | `vrev8`, `vbrev`, `vbrev8`, `vror`, `vrol`, `vwsll`, `vandn` | SIGILL |
-| Zvzip | `vzip.vv`, `vunzipe.v`, `vunzipo.v`, `vpaire.vv`, `vpairo.vv` | SIGILL |
-| Zvfbfmin | `vfwcvtbf16.f.f.v`, `vfncvtbf16.f.f.w` | SIGILL |
-| XSpacemiT (XSMTVDotII) | `smt.vpack.vv`, `smt.vupack.vv`, `smt.vnpack(4).vv`, `smt.vnspack(4).vv` | SIGILL (`smt.vmadot` runs, but it is a dot product) |
-| XSfmm, XSfvcp, XAndes, XTHead, Zvfofp8min, Zvvm | tile moves `sf.vtmv.*`, `sf.vc.*`, `nds.vfwcvt.s.bf16`, tile loads, ... | not in the board's ISA string; not probed |
 
 `n` is the VL, `p` a constant permutation, `q` its inverse.
 
@@ -269,7 +396,7 @@ The tablegen files read for the list are `RISCVInstrInfoV.td`, `RISCVInstrInfoVP
 
 A Triton op that lowers to several RVV instructions can be reversed one instruction at a time from its last one, since each rebuilt value joins `v`'s equivalence class and the next step can read it (`DocReverse.md`, "Chained pattern"). Only the instructions on the data path from `v` to `y` must be reversible. Instructions off that path (index builders such as `vid` / `vrsub`, constant loads, masks) are never inverted; their results only have to be live at the site, as the flip rebuild does with `idx`.
 
-For an op `v -> i1 -> t1 -> ... -> i4 -> t4 -> i5 -> y`, peeling `i5` and `i4` gives `t3` back. If `i3` is in the second table:
+For an op `v -> i1 -> t1 -> ... -> i4 -> t4 -> i5 -> y`, peeling `i5` and `i4` gives `t3` back. If `i3` is in a "not reversible alone" table:
 
 - If the part `i3` drops is held by a value live at the site (the partner slide, the other `vnsrl` half, the complement of an `vand`), `t2` can be rebuilt and peeling continues down to `v`.
 - If not, `v` cannot be rebuilt by reversal. `t3` and `t4` still can, which helps when one of them has a distant use; `v` itself is left to a direct option from a root that is still live.
