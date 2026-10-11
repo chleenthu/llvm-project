@@ -196,6 +196,47 @@ The table is the same for f32 and f16.
 Raw tables: `stall/f32/vfmul_m{1,2,4,8}.txt`, `stall/f32/vfmul_chain_m{1,2,4,8}.txt`,
 `stall/f16/vfmul_m{1,2,4,8}.txt`, `stall/f16/vfmul_chain_m{1,2,4,8}.txt`.
 
+## Results: mask producer (`vmslt.vv`)
+The producer is a compare at LMUL L that writes one mask register, like
+`%44:vr = PseudoVMSLT_VV_M4 %30, %68`. Three consumers, all reading that mask
+(`GEN=genmask.py ./run.sh L 12 "" CHAIN`):
+
+| Pattern | Producer -> consumer |
+|---|---|
+| MA | `vmslt.vv vM` -> `vmand.mm vD, vM, vM` (mask op, like `PseudoVMAND_MM_B8`) |
+| MV | `vmslt.vv vM` -> `vmv1r.v vD, vM` (what `$v0 = COPY %44` becomes) |
+| MK | `vmslt.vv v0` -> `vadd.vv vY, vS, vS, v0.t` at LMUL L (a `v0.t`-masked op, like a masked vmerge or store) |
+
+| LMUL | Stall at distance 0 | Vector instrs needed between | Scalar instrs needed between |
+|---|---|---|---|
+| m1 | 2.0 (throughput and chain) | 2 | 10 (`nop`) / 12 (`alu`) |
+| m2 | 2.0 | 2 | 12 (`nop`) / >12 (`alu`) |
+| m4 | 2.0 | 1 | >12 |
+| m8 | 2.0 | 1 | >12 |
+
+The values are the same for MA, MV and MK.
+
+- **A mask compare stalls its consumer about 2 cycles at every LMUL**, m4 and m8
+  included, and in throughput mode too. So the "no stall from m4 up" result for
+  full-width ops does not apply. There the consumer's own long occupancy covered the
+  latency; the consumers of a mask are short, so nothing covers it.
+- So the gap does not come from the producer's LMUL row (m4 -> 0) or from the m1 row.
+  It is its own case: 2 vector instructions at m1/m2, 1 at m4/m8, since an m4/m8 filler
+  is long.
+- Scalar fillers barely help. At m4/m8 in chain mode the stall is still 2.0 cycles at
+  N = 12, so only vector instructions in between count.
+- MK in throughput mode reads 3 cycles at m2-m8, and with vector fillers it falls to 1 and
+  stays there at any N. The extra cycle comes from the next copy's compare rewriting `v0`
+  right after this copy's masked op reads it, which only happens in the dep version. In
+  chain mode MK reaches 0 with 1 vector filler at m4, like MA and MV.
+- Cycles per copy at distance 0 (throughput, dep / nodep): MA 5.0 / 3.0 at m1, 11.0 / 9.0
+  at m4, 19.3 / 17.1 at m8.
+- Only `vmslt.vv` was measured. `ExpandPseudos` assumes the other integer and float
+  compares (`vmseq`, `vmsne`, `vmsle`, `vmsgt`, `vmfeq`, `vmflt`, ...) behave the same.
+
+Raw tables: `stall/mask/vmslt_m{1,2,4,8}.txt` (throughput) and
+`stall/mask/vmslt_chain_m{1,2,4,8}.txt` (chain).
+
 ## Minimum gap when sinking (m1, m2)
 When moving a producer down toward its consumer (or a consumer up toward its producer), keep
 at least this many independent instructions between them. These are the "instrs needed
@@ -341,7 +382,9 @@ nosched : L C C L L C C S C L C L C C S L C C C S L C C C C L C S
    - i32: `vadd` behaves like `vfadd`. `vmul` needs more: 3 vector instructions for CC and
      CS at m1, plus a 2-cycle LC stall and a small CS stall at m2.
 2. At **LMUL = 4 and 8**, spacing producer and consumer apart gains nothing, for f32,
-   f16 and i32, add and multiply alike.
+   f16 and i32, add and multiply alike. The exception is a mask compare: its consumer
+   stalls about 2 cycles at every LMUL and needs 1 vector instruction between at m4/m8
+   (2 at m1/m2).
    What helps is overlapping loads with compute and limiting how loads and stores mix.
 3. For s279, m8 loses to m4 because of spills, whatever the schedule. m4 with `topdown`
    is the fastest measured version.
@@ -353,6 +396,7 @@ nosched : L C C L L C C S C L C L C C S L C C C S L C C C C L C S
 |---|---|
 | `run.sh [LMUL] [MAXN] [PATTERN] [CHAIN] [OP]` | generate, copy to the board, build and run the microbenchmark (e.g. `./run.sh 1 12 "" 1 vmul`); OP = `vfadd` (default), `vfmul`, `vadd`, `vmul`; prefix `SEW=16` for e16 (f16) |
 | `gen.py` | writes `bench.S` and `tests.h` |
+| `genmask.py` | same for the mask-producer tests (MA, MV, MK); select with `GEN=genmask.py` |
 | `driver.c` | runs each test with the cycle counter and prints dep / nodep / stall |
 | `s279.sh [LMULs]` | s279 check, default LMULs 1 2 4 8 (`BUILD=1` rebuilds llvm first, as `g.sh` does) |
 | `s279drv.c` | timing driver for `s279()` |
@@ -373,3 +417,9 @@ Minimum gap (vector / scalar-only instructions) that `FindFirstUseToSinkTo`, `Fi
 | CC | 2 / 10 (int mul: 3 / 12) | 1 / 7 (int mul: 1 / 12) | 0 |
 | CS | 3 / 5 (int mul: 3 / 6) | 0 / 0 (int mul: 2 / 6) | 0 |
 | LS | 4 / 8 | 0 / 0 | 0 |
+| mask compare -> any | 2 / 12 | 2 / none | 1 / none |
+
+A mask-compare producer (`isMaskCompareName`: `PseudoVMSEQ/SNE/SLT/SLE/SGT` and
+`PseudoVMFEQ/FNE/FLT/FLE/FGT/FGE`) takes the last row whatever the consumer is. "none"
+(`NoScalarGap`) means no number of scalar-only instructions counts as enough; the gap
+must contain vector instructions.
