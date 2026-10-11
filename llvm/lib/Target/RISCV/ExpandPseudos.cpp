@@ -1397,7 +1397,8 @@ static std::optional<ReverseOp> matchDirectOp(const TargetInstrInfo *TII,
 }
 
 // The value of a VL or scalar operand known at compile time: an immediate, or
-// a register set by `ADDI $x0, imm` (li).
+// a register set by a constant materialization (li: `ADDI $x0, imm`, or a
+// chain of LUI / ADDI / ADDIW / SLLI / SRLI such as `li -1 ; srli 32`).
 static std::optional<int64_t> constOperand(const MachineOperand &MO,
                                            const MachineRegisterInfo &MRI) {
   if (MO.isImm())
@@ -1409,10 +1410,28 @@ static std::optional<int64_t> constOperand(const MachineOperand &MO,
   if (!MO.getReg().isVirtual())
     return std::nullopt;
   const MachineInstr *D = MRI.getUniqueVRegDef(MO.getReg());
-  if (D && D->getOpcode() == RISCV::ADDI && D->getOperand(1).isReg() &&
-      D->getOperand(1).getReg() == RISCV::X0 && D->getOperand(2).isImm())
-    return D->getOperand(2).getImm();
-  return std::nullopt;
+  if (!D || D->getNumExplicitOperands() < 2 ||
+      !D->getOperand(D->getNumExplicitOperands() - 1).isImm())
+    return std::nullopt;
+  int64_t Imm = D->getOperand(D->getNumExplicitOperands() - 1).getImm();
+  if (D->getOpcode() == RISCV::LUI)
+    return SignExtend64<32>(uint64_t(Imm) << 12);
+  unsigned Opc = D->getOpcode();
+  if (Opc != RISCV::ADDI && Opc != RISCV::ADDIW && Opc != RISCV::SLLI &&
+      Opc != RISCV::SRLI)
+    return std::nullopt;
+  if (!D->getOperand(1).isReg())
+    return std::nullopt;
+  std::optional<int64_t> Src = constOperand(D->getOperand(1), MRI);
+  if (!Src)
+    return std::nullopt;
+  uint64_t U = *Src;
+  switch (Opc) {
+  case RISCV::ADDI: return int64_t(U + Imm);
+  case RISCV::ADDIW: return SignExtend64<32>(U + Imm);
+  case RISCV::SLLI: return int64_t(U << (Imm & 63));
+  default: return int64_t(U >> (Imm & 63)); // SRLI
+  }
 }
 
 // A VL operand known to be a constant element count (VLMAX, -1, is not).
@@ -1710,6 +1729,8 @@ struct RevPlan {
     BitRotate,   // v = rotl(Y, s) from Y = rotr(v, s) = v >> s | v << SEW-s
     Flip,        // v = flip(Y) from Y = flip(v): the lane reverse again
     PermGather,  // v = gather(Y, inverse(p)) from Y = gather(v, p)
+    Unshift,     // v = Y >> s from Y = v << s, v's top s bits known zero
+    ZextNarrow,  // v = zext(Y) from Y = vnsrl(v, 0), v's top half known zero
   };
   KindTy Kind = Elementwise;
   // The instructions computing the group's result from v (Fwd[0] is the use
@@ -1766,6 +1787,8 @@ static const char *planName(RevPlan::KindTy K) {
   case RevPlan::BitRotate: return "inverse-bit-rotation";
   case RevPlan::Flip: return "flip-of-flip";
   case RevPlan::PermGather: return "inverse-permutation-gather";
+  case RevPlan::Unshift: return "srl-of-sll";
+  case RevPlan::ZextNarrow: return "zext-of-narrow";
   }
   return "?";
 }
@@ -1789,6 +1812,15 @@ static std::string halfLMul(StringRef L) {
   for (unsigned I = 1; I != std::size(Order); ++I)
     if (L == Order[I])
       return Order[I - 1];
+  return "";
+}
+
+// The LMUL name of twice LMUL L ("M2" -> "M4", "MF2" -> "M1").
+static std::string doubleLMul(StringRef L) {
+  static const char *Order[] = {"MF8", "MF4", "MF2", "M1", "M2", "M4", "M8"};
+  for (unsigned I = 0; I + 1 != std::size(Order); ++I)
+    if (L == Order[I])
+      return Order[I + 1];
   return "";
 }
 
@@ -1864,6 +1896,98 @@ static bool isVlenbMinus(Register R, int E, int64_t Sub,
   return D && D->getOpcode() == RISCV::ADDI && D->getOperand(1).isReg() &&
          D->getOperand(2).isImm() && D->getOperand(2).getImm() == -Sub &&
          vlenbScale(D->getOperand(1).getReg(), MRI) == E;
+}
+
+// Whether an instruction with VL operand Have writes at least the elements
+// [0, Need) that an instruction with VL operand Need reads, both counting
+// elements of the same width.
+static bool vlCovers(const MachineOperand &Have, const MachineOperand &Need,
+                     const MachineRegisterInfo &MRI) {
+  if (Have.isImm() && Have.getImm() < 0) // VLMAX: the whole register group
+    return true;
+  if (Have.isReg() && Need.isReg() && Have.getReg() == Need.getReg())
+    return true;
+  std::optional<int64_t> H = constVL(Have, MRI), N = constVL(Need, MRI);
+  return H && N && *H >= *N;
+}
+
+// The number of high bits known to be zero in each of the first VL elements
+// of R (VL being the operand VL), viewing the elements as Bits wide. A shift
+// left by s is undone by a shift right where R has s such bits, and vnsrl.wi
+// 0 by vzext.vf2 where the wide R has the upper half zero. Only R's unique
+// def is looked at, through copies, zero extensions, right shifts, ANDs with
+// a constant, splats of a constant and narrowing right shifts.
+static unsigned knownZeroHighBits(const TargetInstrInfo *TII,
+                                  const MachineRegisterInfo &MRI, Register R,
+                                  unsigned Bits, const MachineOperand &VL,
+                                  unsigned Depth = 0) {
+  if (!R.isVirtual() || Depth > 6)
+    return 0;
+  const MachineInstr *D = MRI.getUniqueVRegDef(R);
+  if (!D)
+    return 0;
+  if (D->isCopy()) {
+    const MachineOperand &Src = D->getOperand(1);
+    if (Src.getSubReg() || D->getOperand(0).getSubReg())
+      return 0;
+    return knownZeroHighBits(TII, MRI, Src.getReg(), Bits, VL, Depth + 1);
+  }
+  StringRef Name;
+  if (!isPlainRVV(TII, *D, Name) || !hasUndefPassthru(*D) ||
+      !vlCovers(vlOperand(*D), VL, MRI))
+    return 0;
+  unsigned SEW = 1u << log2SEWOf(*D);
+  if (SEW != Bits)
+    return 0;
+  StringRef N = Name.drop_front(strlen("PseudoV"));
+  auto ConstBits = [&](const MachineOperand &MO) -> std::optional<uint64_t> {
+    std::optional<int64_t> C = constOperand(MO, MRI);
+    if (!C)
+      return std::nullopt;
+    return uint64_t(*C) & maskTrailingOnes<uint64_t>(SEW);
+  };
+  auto Src = [&](unsigned Idx, unsigned SrcBits) {
+    const MachineOperand &MO = D->getOperand(Idx);
+    if (!MO.isReg() || MO.getSubReg())
+      return 0u;
+    return knownZeroHighBits(TII, MRI, MO.getReg(), SrcBits, VL, Depth + 1);
+  };
+
+  // vzext.vf<n>: the top SEW - SEW/n bits.
+  if (N.starts_with("ZEXT_VF") && N.size() > 7 && isDigit(N[7]))
+    return SEW - SEW / (N[7] - '0');
+  // vsrl by s: s more zero bits on top of the source's.
+  if (N.starts_with("SRL_VI_") || N.starts_with("SRL_VX_")) {
+    std::optional<uint64_t> S = ConstBits(D->getOperand(3));
+    if (!S)
+      return 0;
+    uint64_t Sh = *S & (SEW - 1); // only log2(SEW) bits of the amount count
+    return std::min<uint64_t>(SEW, Src(2, SEW) + Sh);
+  }
+  // vand: the zeros of either source, or of the constant.
+  if (N.starts_with("AND_VI_") || N.starts_with("AND_VX_")) {
+    std::optional<uint64_t> C = ConstBits(D->getOperand(3));
+    unsigned FromC = C ? countl_zero(*C) - (64 - SEW) : 0;
+    return std::max(FromC, Src(2, SEW));
+  }
+  if (N.starts_with("AND_VV_"))
+    return std::max(Src(2, SEW), Src(3, SEW));
+  // vmv.v.i / vmv.v.x of a constant.
+  if (N.starts_with("MV_V_I_") || N.starts_with("MV_V_X_")) {
+    std::optional<uint64_t> C = ConstBits(D->getOperand(2));
+    return C ? countl_zero(*C) - (64 - SEW) : 0;
+  }
+  // vnsrl.w[ix] by s: bits [s, s + SEW) of the 2*SEW bit source.
+  if (N.starts_with("NSRL_WI_") || N.starts_with("NSRL_WX_")) {
+    std::optional<uint64_t> S = ConstBits(D->getOperand(3));
+    if (!S)
+      return 0;
+    uint64_t Sh = *S & (2 * SEW - 1);
+    uint64_t Wide = Src(2, 2 * SEW); // zero from bit 2*SEW - Wide up
+    uint64_t Top = 2 * SEW - Wide;   // the source's bits below that
+    return Top <= Sh ? SEW : SEW - std::min<uint64_t>(SEW, Top - Sh);
+  }
+  return 0;
 }
 
 // Lane reverse (tl.flip, a <n-1,...,1,0> shuffle). LLVM lowers it as
@@ -2211,9 +2335,25 @@ static void matchGroupPlans(const TargetInstrInfo *TII,
   // vfwcvt and vwadd(u).vx it is the narrow source's.
   if (VIsSrc && hasUndefPassthru(Q)) {
     unsigned Rev = 0, VLog2SEW = Log2SEW;
-    if (N.starts_with("SEXT_VF2_") || N.starts_with("ZEXT_VF2_")) {
-      Rev = Opcode("PseudoVNSRL_WI_" + halfLMul(L));
-      VLog2SEW = Log2SEW - 1;
+    SmallVector<unsigned, 3> Steps;
+    if (N.starts_with("SEXT_VF") || N.starts_with("ZEXT_VF")) {
+      // vf2 / vf4 / vf8: one vnsrl.wi 0 per halving of SEW, each at half the
+      // LMUL of the one before.
+      unsigned Log2F = N[7] == '2' ? 1 : N[7] == '4' ? 2 : N[7] == '8' ? 3 : 0;
+      std::string SL = L.str();
+      for (unsigned I = 0; I != Log2F; ++I) {
+        SL = halfLMul(SL);
+        unsigned Opc = SL.empty() ? 0 : Opcode("PseudoVNSRL_WI_" + SL);
+        if (!Opc) {
+          Steps.clear();
+          break;
+        }
+        Steps.push_back(Opc);
+      }
+      if (!Steps.empty()) {
+        Rev = Steps.back();
+        VLog2SEW = Log2SEW - Steps.size();
+      }
     } else if ((N.starts_with("WADD_VX_") || N.starts_with("WADDU_VX_")) &&
                Q.getOperand(3).isReg() &&
                Q.getOperand(3).getReg() == RISCV::X0) {
@@ -2232,8 +2372,10 @@ static void matchGroupPlans(const TargetInstrInfo *TII,
       RevPlan P;
       P.Kind = RevPlan::Narrow;
       P.Fwd = {&Q};
-      P.Ins.push_back({QDst, QPos + 1, {{Rev, 2}}});
-      P.Opcs = {Rev};
+      if (Steps.empty())
+        Steps.push_back(Rev);
+      P.Ins.push_back({QDst, QPos + 1, {{Steps[0], 2}}});
+      P.Opcs = Steps;
       P.Valid = makeRange(vlOperand(Q), VLog2SEW, TII->get(Rev),
                           1u << VLog2SEW);
       Out.push_back(P);
@@ -2336,6 +2478,41 @@ static void matchGroupPlans(const TargetInstrInfo *TII,
     }
   }
 
+  // The same rotation in the other order: vslideup r, v, k fills lanes k..n-1
+  // with v[0..n-k-1], then vslidedown r, v, n-k at VL k, tail undisturbed,
+  // fills lanes 0..k-1 with v[n-k..n-1]. That rotates by n-k, so the inverse
+  // is the rotation by k, rebuilt down then up at VL n.
+  if (VIsSrc && N.starts_with("SLIDEUP_V") && hasUndefPassthru(Q)) {
+    std::optional<int64_t> NL = constVL(vlOperand(Q), MRI);
+    std::optional<int64_t> K = constOperand(Q.getOperand(3), MRI);
+    MachineInstr *W = NextDef(QDst, QPos);
+    StringRef WName;
+    if (NL && K && *K > 0 && *K < *NL && W && isPlainRVV(TII, *W, WName) &&
+        WName.starts_with("PseudoVSLIDEDOWN_V") && lmulSuffix(WName) == L &&
+        W->getOperand(1).getReg() == QDst &&
+        W->getOperand(2).getReg() == VIn && log2SEWOf(Q) == log2SEWOf(*W) &&
+        constVL(vlOperand(*W), MRI) == *K &&
+        RISCVII::hasVecPolicyOp(W->getDesc().TSFlags) &&
+        !(W->getOperand(RISCVII::getVecPolicyOpNum(W->getDesc())).getImm() &
+          RISCVVType::TAIL_AGNOSTIC) &&
+        constOperand(W->getOperand(3), MRI) == *NL - *K &&
+        !DefIn(VIn, QPos + 1, BM.Pos.lookup(W) + 1)) {
+      unsigned Down = Opcode(Twine("PseudoVSLIDEDOWN_") +
+                             amountForm(Q.getOperand(3)) + L);
+      unsigned Up =
+          Opcode(Twine("PseudoVSLIDEUP_") + amountForm(W->getOperand(3)) + L);
+      if (Down && Up) {
+        RevPlan P;
+        P.Kind = RevPlan::Rotate;
+        P.Fwd = {&Q, W};
+        P.Ins.push_back({QDst, BM.Pos.lookup(W) + 1, {{Down, 2}, {Up, 2}}});
+        P.Opcs = {Down, Up};
+        P.Valid = makeRange(vlOperand(Q), Log2SEW, TII->get(Up), SEW);
+        Out.push_back(P);
+      }
+    }
+  }
+
   // Rotation of the bits of each element: y = v >> s | v << (SEW - s). With
   // s = SEW/2 this swaps adjacent lanes of half the width, which is how
   // LLVM lowers a <1,0,3,2,...> shuffle. Inverse: v = y << s | y >> SEW-s.
@@ -2397,6 +2574,43 @@ static void matchGroupPlans(const TargetInstrInfo *TII,
       P.Valid = makeRange(vlOperand(Q), Log2SEW, O->getDesc(), SEW);
       Out.push_back(P);
       break;
+    }
+  }
+
+  // Shift left by a constant s alone: v = Y >> s where the top s bits of v
+  // are known zero (e.g. v is a zero extension or was shifted right).
+  if (VIsSrc && (N.starts_with("SLL_VI_") || N.starts_with("SLL_VX_")) &&
+      hasUndefPassthru(Q)) {
+    std::optional<int64_t> S = constOperand(Q.getOperand(3), MRI);
+    unsigned Srl =
+        Opcode(Twine("PseudoVSRL_") + amountForm(Q.getOperand(3)) + L);
+    if (S && *S > 0 && *S < int64_t(SEW) && Srl &&
+        knownZeroHighBits(TII, MRI, VIn, SEW, vlOperand(Q)) >= *S) {
+      RevPlan P;
+      P.Kind = RevPlan::Unshift;
+      P.Fwd = {&Q};
+      P.Ins.push_back({QDst, QPos + 1, {{Srl, 2}}});
+      P.Opcs = {Srl};
+      P.Valid = makeRange(vlOperand(Q), Log2SEW, TII->get(Srl), SEW);
+      Out.push_back(P);
+    }
+  }
+
+  // The low half alone, Y = vnsrl.wi v, 0: v = vzext.vf2 Y where the top half
+  // of each 2*SEW bit element of v is known zero.
+  if (VIsSrc && (N.starts_with("NSRL_WI_") || N.starts_with("NSRL_WX_")) &&
+      hasUndefPassthru(Q) && constOperand(Q.getOperand(3), MRI) == 0 &&
+      SEW < 64) {
+    unsigned Zext = Opcode("PseudoVZEXT_VF2_" + doubleLMul(L));
+    if (Zext &&
+        knownZeroHighBits(TII, MRI, VIn, 2 * SEW, vlOperand(Q)) >= SEW) {
+      RevPlan P;
+      P.Kind = RevPlan::ZextNarrow;
+      P.Fwd = {&Q};
+      P.Ins.push_back({QDst, QPos + 1, {{Zext, 2}}});
+      P.Opcs = {Zext};
+      P.Valid = makeRange(vlOperand(Q), Log2SEW + 1, TII->get(Zext), 2 * SEW);
+      Out.push_back(P);
     }
   }
 }
@@ -2998,19 +3212,29 @@ bool ExpandPseudos::ProcessReverseRematChain(MachineFunction &MF) {
         break;
       }
       case RevPlan::Narrow: {
-        unsigned Opc = Plan.Opcs[0];
-        StringRef Name = TII->getName(Opc);
-        MachineInstrBuilder MIB = Build(Opc, NewV);
-        MIB.addReg(NewV, RegState::Undef).addReg(In0);
-        if (Name.starts_with("PseudoVNSRL_WI"))
-          MIB.addImm(0);
-        bool ReadsFRM = Name.starts_with("PseudoVFNCVT_F_F");
-        if (ReadsFRM) // exact, so any rounding mode will do
-          MIB.addImm(RISCVFPRndMode::DYN);
-        AddVLSEW(MIB, *Q, Plan.Valid.Log2SEW);
-        if (ReadsFRM)
-          MIB.addReg(RISCV::FRM, RegState::Implicit);
-        MIB->setFlag(MachineInstr::NoFPExcept);
+        // One step per halving of SEW (several only for vsext / vzext.vf4
+        // and vf8); every step but the last writes a temporary.
+        Register Src = In0;
+        for (unsigned I = 0, E = Plan.Opcs.size(); I != E; ++I) {
+          unsigned Opc = Plan.Opcs[I];
+          StringRef Name = TII->getName(Opc);
+          Register Dst = NewV;
+          if (I + 1 != E)
+            Dst = MRI->createVirtualRegister(
+                TII->getRegClass(TII->get(Opc), 0));
+          MachineInstrBuilder MIB = Build(Opc, Dst);
+          MIB.addReg(Dst, RegState::Undef).addReg(Src);
+          if (Name.starts_with("PseudoVNSRL_WI"))
+            MIB.addImm(0);
+          bool ReadsFRM = Name.starts_with("PseudoVFNCVT_F_F");
+          if (ReadsFRM) // exact, so any rounding mode will do
+            MIB.addImm(RISCVFPRndMode::DYN);
+          AddVLSEW(MIB, *Q, Plan.Valid.Log2SEW + (E - 1 - I));
+          if (ReadsFRM)
+            MIB.addReg(RISCV::FRM, RegState::Implicit);
+          MIB->setFlag(MachineInstr::NoFPExcept);
+          Src = Dst;
+        }
         break;
       }
       case RevPlan::ZipHalf: {
@@ -3036,16 +3260,35 @@ bool ExpandPseudos::ProcessReverseRematChain(MachineFunction &MF) {
         break;
       }
       case RevPlan::Rotate: {
-        // Down by n-k, then the k lanes that fell off the end back up.
+        // Down by n-k, then the k lanes that fell off the end back up. When
+        // the forward pair slid up by k first (its slidedown runs at VL k),
+        // the amounts swap and both slides run at Q's VL n.
         MachineInstr *W = Plan.Fwd[1];
+        bool UpFirst =
+            TII->getName(Q->getOpcode()).starts_with("PseudoVSLIDEUP");
+        MachineInstr *DownAmt = UpFirst ? Q : W, *UpAmt = UpFirst ? W : Q;
         MachineInstrBuilder Down = Build(Plan.Opcs[0], NewV);
         Down.addReg(NewV, RegState::Undef)
             .addReg(In0)
-            .add(copyUse(W->getOperand(3)));
+            .add(copyUse(DownAmt->getOperand(3)));
         AddVLSEWPolicy(Down, *Q);
         MachineInstrBuilder Up = Build(Plan.Opcs[1], NewV);
-        Up.addReg(NewV).addReg(In0).add(copyUse(Q->getOperand(3)));
-        AddVLSEWPolicy(Up, *W);
+        Up.addReg(NewV).addReg(In0).add(copyUse(UpAmt->getOperand(3)));
+        AddVLSEWPolicy(Up, UpFirst ? *Q : *W);
+        break;
+      }
+      case RevPlan::Unshift: {
+        MachineInstrBuilder MIB = Build(Plan.Opcs[0], NewV);
+        MIB.addReg(NewV, RegState::Undef)
+            .addReg(In0)
+            .add(copyUse(Q->getOperand(3)));
+        AddVLSEWPolicy(MIB, *Q);
+        break;
+      }
+      case RevPlan::ZextNarrow: {
+        MachineInstrBuilder MIB = Build(Plan.Opcs[0], NewV);
+        MIB.addReg(NewV, RegState::Undef).addReg(In0);
+        AddVLSEW(MIB, *Q, Plan.Valid.Log2SEW);
         break;
       }
       case RevPlan::Flip: {
