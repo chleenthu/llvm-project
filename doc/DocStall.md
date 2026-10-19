@@ -196,6 +196,47 @@ The table is the same for f32 and f16.
 Raw tables: `stall/f32/vfmul_m{1,2,4,8}.txt`, `stall/f32/vfmul_chain_m{1,2,4,8}.txt`,
 `stall/f16/vfmul_m{1,2,4,8}.txt`, `stall/f16/vfmul_chain_m{1,2,4,8}.txt`.
 
+## Results: mask producer (`vmslt.vv`)
+The producer is a compare at LMUL L that writes one mask register, like
+`%44:vr = PseudoVMSLT_VV_M4 %30, %68`. Three consumers, all reading that mask
+(`GEN=genmask.py ./run.sh L 12 "" CHAIN`):
+
+| Pattern | Producer -> consumer |
+|---|---|
+| MA | `vmslt.vv vM` -> `vmand.mm vD, vM, vM` (mask op, like `PseudoVMAND_MM_B8`) |
+| MV | `vmslt.vv vM` -> `vmv1r.v vD, vM` (what `$v0 = COPY %44` becomes) |
+| MK | `vmslt.vv v0` -> `vadd.vv vY, vS, vS, v0.t` at LMUL L (a `v0.t`-masked op, like a masked vmerge or store) |
+
+| LMUL | Stall at distance 0 | Vector instrs needed between | Scalar instrs needed between |
+|---|---|---|---|
+| m1 | 2.0 (throughput and chain) | 2 | 10 (`nop`) / 12 (`alu`) |
+| m2 | 2.0 | 2 | 12 (`nop`) / >12 (`alu`) |
+| m4 | 2.0 | 1 | >12 |
+| m8 | 2.0 | 1 | >12 |
+
+The values are the same for MA, MV and MK.
+
+- **A mask compare stalls its consumer about 2 cycles at every LMUL**, m4 and m8
+  included, and in throughput mode too. So the "no stall from m4 up" result for
+  full-width ops does not apply. There the consumer's own long occupancy covered the
+  latency; the consumers of a mask are short, so nothing covers it.
+- So the gap does not come from the producer's LMUL row (m4 -> 0) or from the m1 row.
+  It is its own case: 2 vector instructions at m1/m2, 1 at m4/m8, since an m4/m8 filler
+  is long.
+- Scalar fillers barely help. At m4/m8 in chain mode the stall is still 2.0 cycles at
+  N = 12, so only vector instructions in between count.
+- MK in throughput mode reads 3 cycles at m2-m8, and with vector fillers it falls to 1 and
+  stays there at any N. The extra cycle comes from the next copy's compare rewriting `v0`
+  right after this copy's masked op reads it, which only happens in the dep version. In
+  chain mode MK reaches 0 with 1 vector filler at m4, like MA and MV.
+- Cycles per copy at distance 0 (throughput, dep / nodep): MA 5.0 / 3.0 at m1, 11.0 / 9.0
+  at m4, 19.3 / 17.1 at m8.
+- Only `vmslt.vv` was measured. `ExpandPseudos` assumes the other integer and float
+  compares (`vmseq`, `vmsne`, `vmsle`, `vmsgt`, `vmfeq`, `vmflt`, ...) behave the same.
+
+Raw tables: `stall/mask/vmslt_m{1,2,4,8}.txt` (throughput) and
+`stall/mask/vmslt_chain_m{1,2,4,8}.txt` (chain).
+
 ## Minimum gap when sinking (m1, m2)
 When moving a producer down toward its consumer (or a consumer up toward its producer), keep
 at least this many independent instructions between them. These are the "instrs needed
@@ -289,6 +330,14 @@ The extra llc flag for each option (the clang command is the same for all):
 - **`-mtune=generic` changes nothing:** it produces byte-identical assembly to `default` at
   every LMUL, because generic is already llc's default tuning. Its cycle differences from
   `default` (up to about 1%) are therefore run-to-run noise.
+- **The `x60` column did not test the X60 model:** it is also byte-identical to `default`
+  (apart from the `.attribute` lines). The IR from clang carries `"target-cpu"="generic-rv64"`
+  on the function, and that overrides `llc -mcpu`. Even with the attribute removed nothing
+  changes, because in this tree `generic-rv64` already uses `SpacemitX60Model`
+  (`RISCVProcessors.td:105`, upstream `5e8d4064bc74`, "[RISCV] Adopt SpacemitX60's scheduling
+  model for `-mtune=generic`", 2026-06-09). So `default` already schedules with the X60 latencies
+  (e.g. `VL4RE32_V` at m4 has latency 8 either way), and the `x60` differences are noise too.
+  To really build for the X60, pass `-mcpu=spacemit-x60` to clang (results below).
 - **m8 needs forcing:** with `--riscv-v-register-bit-width-lmul=8` alone, the vectorizer still
   picks `<vscale x 8 x i32>` (m4), and the IR is identical to the m4 build. `s279.sh` gets a
   real m8 loop by adding
@@ -329,6 +378,94 @@ topdown : L C L C L C L C L C S C C C C S C L C S L C C C C L C S
 nosched : L C C L L C C S C L C L C C S L C C C S L C C C C L C S
 ```
 
+### s279 with `-mcpu=spacemit-x60` applied
+Re-measured in one session (`stall/s279out/x60real.txt`). "llc x60" removes the `target-cpu`
+attribute from the IR (`m$L.nocpu.llir`) and runs `llc -mcpu=spacemit-x60`. "clang x60" passes
+`-mcpu=spacemit-x60` to clang, with the other clang flags as in `s279.sh` (`m$L.clangx60.s`; its
+`.addrsig` line is also stripped before assembling on the board).
+
+| LMUL | default | llc x60 (attribute removed) | clang `-mcpu=spacemit-x60` | spills (all three) |
+|---|---|---|---|---|
+| m1 | 10548 | 10538 (identical code) | 10515 | 7 |
+| m2 | 7753 | 7724 (identical code) | 7695 | 7 |
+| m4 | 6824 | 6827 (identical code) | 6752 (-1%) | 7 |
+| m8 | 16457 | 16433 (identical code) | 15595 (-5%) | 17 |
+
+- **llc x60:** the code is identical to `default`, since both already use the X60 scheduling model.
+- **clang x60:** the loop does change (24 vector lines differ at m1-m4, 46 at m8), and m4/m8 are a
+  little faster. The scheduling model is the same, and `-mtune=spacemit-x60` (X60 tune flags only)
+  gives byte-identical code to default, so the change comes only from the X60's extensions (Zba).
+- The best LLVM s279 is still m4 `topdown` (6479 above), ahead of clang x60 at m4 (6752).
+
+`-mcpu=spacemit-x60` and `-mcpu=spacemit-x60 -march=rv64gcv` have the same scheduling model
+(`SpacemitX60Model`) and the same tune flags; `-march` replaces only the CPU's ISA. These are the
+features that `-mcpu=spacemit-x60` turns on and `-mcpu=spacemit-x60 -march=rv64gcv` doesn't:
+
+```
++b +zba +zbb +zbs +zbc +zbkc      bit-manip (sh2add, andn, ...)
++zfh +zfhmin +zvfh +zvfhmin       half-precision scalar / vector
++zicond +zicbom +zicbop +zicboz   czero, cache-block ops
++zvl256b                          VLEN >= 256 known at compile time
++xsmtvdot +zvkt +zkt ...          vendor dot-product, constant-time
++ss*/sv*/zic*/za64rs ...          privileged / profile features
+```
+
+On s279, `-mcpu=spacemit-x60 -march=rv64gcv` gives byte-identical code to plain `-march=rv64gcv`;
+only `-mcpu=spacemit-x60` alone changes the loop (Zba: `slli` + `add` becomes `sh2add`).
+
+### `target-cpu=generic-rv64` vs `spacemit-x60`
+How clang's flags reach the IR (and llc):
+
+| clang flag | IR attribute | llc flag | Controls |
+|---|---|---|---|
+| `-march=rv64gcv` | `"target-features"` | `-mattr=+m,+v,...` | ISA extensions |
+| `-mcpu=spacemit-x60` | `"target-cpu"` (+ that CPU's features) | `-mcpu=` | CPU: default features and default tuning |
+| `-mtune=generic-ooo` | `"tune-cpu"` | `-mtune=` | scheduling model and tune flags only |
+
+With only `-march`, clang still writes `"target-cpu"="generic-rv64"` (the default CPU). `-march`
+replaces only the CPU's extension list; it does not touch `target-cpu` or `tune-cpu`
+(`clang -mcpu=spacemit-x60 -march=rv64gcv -mtune=generic-ooo` keeps `target-cpu=spacemit-x60` and
+`tune-cpu=generic-ooo`). The scheduling model comes from the tune CPU, which is the CPU when
+`-mtune` is not given (`RISCVSubtarget.cpp:97`).
+
+The two CPUs share only the scheduling model (`RISCVProcessors.td:105`, `:888`):
+
+| | `generic-rv64` | `spacemit-x60` |
+|---|---|---|
+| Scheduling model | `SpacemitX60Model` | `SpacemitX60Model` (same) |
+| Default ISA | `+64bit,+i` only (the rest from `-march`) | RVA22S64 + V + X60 extensions (list below) |
+| CPU property | - | `+unaligned-scalar-mem` (kept even with `-march`) |
+| Tune flags | `optimized-nf2-segment-load-store`, `enable-select-optimize` | those two, plus `dlen-factor-2` (data path is half of VLEN), `optimized-nf3/nf4-segment-load-store`, `vxrm-pipeline-flush`, `prefer-ascending-load-store`, `no-default-unroll` |
+
+On s279 the extra tune flags change nothing (`-mtune=spacemit-x60` is byte-identical to default).
+
+Complete `target-features` (`+` entries only) from this clang:
+
+`-march=rv64gcv` (24):
+```
++64bit,+a,+c,+d,+f,+i,+m,+relax,+v,+zaamo,+zalrsc,+zca,+zcd,+zicsr,+zifencei,+zmmul,
++zve32f,+zve32x,+zve64d,+zve64f,+zve64x,+zvl128b,+zvl32b,+zvl64b
+```
+
+`-mcpu=spacemit-x60 -march=rv64gcv` (25): the same plus `+unaligned-scalar-mem`.
+
+`-mcpu=spacemit-x60` (63):
+```
++64bit,+a,+b,+c,+d,+f,+i,+m,+relax,+ssccptr,+sscofpmf,+sscounterenw,+sstc,+sstvala,+sstvecd,
++svade,+svbare,+svinval,+svnapot,+svpbmt,+unaligned-scalar-mem,+v,+xsmtvdot,+za64rs,+zaamo,
++zalrsc,+zba,+zbb,+zbc,+zbkc,+zbs,+zca,+zcd,+zfh,+zfhmin,+zic64b,+zicbom,+zicbop,+zicboz,
++ziccamoa,+ziccif,+zicclsm,+ziccrse,+zicntr,+zicond,+zicsr,+zifencei,+zihintpause,+zihpm,
++zkt,+zmmul,+zve32f,+zve32x,+zve64d,+zve64f,+zve64x,+zvfh,+zvfhmin,+zvkt,+zvl128b,+zvl256b,
++zvl32b,+zvl64b
+```
+
+A `+m,+a,...` list is the `llc -mattr=` / `"target-features"` form; clang's `-march` takes an ISA
+string instead, e.g. `-march=rv64gcv_zba_zbb_zbs_zicond_zfh_zvfh_zvl256b`.
+
+triton-cpu kernels (`~/triton-cpu/third_party/cpu/llvm.cc:23-44`) use CPU `generic-rv64` and features
+`+m,+f,+d,+v`: X60 scheduling, but no `+a`/`+c` and no Zba/Zbb. `TRITON_RISCV_MARCH` only affects the
+C code compiled by clang (ELF runners, launcher), not kernel code generation.
+
 ## Conclusions
 1. The dependency-distance rule matters at **LMUL = 1 and 2**. See "Minimum gap when
    sinking" for the gap to keep per pair.
@@ -341,7 +478,9 @@ nosched : L C C L L C C S C L C L C C S L C C C S L C C C C L C S
    - i32: `vadd` behaves like `vfadd`. `vmul` needs more: 3 vector instructions for CC and
      CS at m1, plus a 2-cycle LC stall and a small CS stall at m2.
 2. At **LMUL = 4 and 8**, spacing producer and consumer apart gains nothing, for f32,
-   f16 and i32, add and multiply alike.
+   f16 and i32, add and multiply alike. The exception is a mask compare: its consumer
+   stalls about 2 cycles at every LMUL and needs 1 vector instruction between at m4/m8
+   (2 at m1/m2).
    What helps is overlapping loads with compute and limiting how loads and stores mix.
 3. For s279, m8 loses to m4 because of spills, whatever the schedule. m4 with `topdown`
    is the fastest measured version.
@@ -353,6 +492,7 @@ nosched : L C C L L C C S C L C L C C S L C C C S L C C C C L C S
 |---|---|
 | `run.sh [LMUL] [MAXN] [PATTERN] [CHAIN] [OP]` | generate, copy to the board, build and run the microbenchmark (e.g. `./run.sh 1 12 "" 1 vmul`); OP = `vfadd` (default), `vfmul`, `vadd`, `vmul`; prefix `SEW=16` for e16 (f16) |
 | `gen.py` | writes `bench.S` and `tests.h` |
+| `genmask.py` | same for the mask-producer tests (MA, MV, MK); select with `GEN=genmask.py` |
 | `driver.c` | runs each test with the cycle counter and prints dep / nodep / stall |
 | `s279.sh [LMULs]` | s279 check, default LMULs 1 2 4 8 (`BUILD=1` rebuilds llvm first, as `g.sh` does) |
 | `s279drv.c` | timing driver for `s279()` |
@@ -373,3 +513,103 @@ Minimum gap (vector / scalar-only instructions) that `FindFirstUseToSinkTo`, `Fi
 | CC | 2 / 10 (int mul: 3 / 12) | 1 / 7 (int mul: 1 / 12) | 0 |
 | CS | 3 / 5 (int mul: 3 / 6) | 0 / 0 (int mul: 2 / 6) | 0 |
 | LS | 4 / 8 | 0 / 0 | 0 |
+| mask compare -> any | 2 / 12 | 2 / none | 1 / none |
+
+A mask-compare producer (`isMaskCompareName`: `PseudoVMSEQ/SNE/SLT/SLE/SGT` and
+`PseudoVMFEQ/FNE/FLT/FLE/FGT/FGE`) takes the last row whatever the consumer is. "none"
+(`NoScalarGap`) means no number of scalar-only instructions counts as enough; the gap
+must contain vector instructions.
+
+## s279 with GCC 14 LMUL options
+GCC options (from "GCC 14 RISC-V Vectorization Improvements and Future Work"):
+
+```
+-mriscv-vector-lmul=dynamic    # spelled -mrvv-max-lmul=dynamic in GCC 14.2
+-madjust-lmul-cost
+```
+
+`stall/s279gcc.sh` builds s279 with GCC 14.2 (`~/riscv/bin/riscv64-unknown-elf-gcc`,
+`-O3 -march=rv64gcv_zvl256b -mrvv-vector-bits=zvl`) with each `-mrvv-max-lmul` choice and times it
+on the board with the same driver as `s279.sh`. All builds give the same hash. The option from the
+talk "GCC 14 RISC-V Vectorization Improvements and Future Work", `-mriscv-vector-lmul=dynamic`, is
+spelled `-mrvv-max-lmul=dynamic` in GCC 14.2. `-madjust-lmul-cost` is accepted but undocumented.
+GCC 13.2 (`~/toolchain`) has neither option. Output: `stall/s279gcc/out.txt`, assembly in `stall/s279gcc/*.s`.
+
+| LMUL | GCC 14.2 cycles/call | vector spills/reloads | LLVM default | LLVM best |
+|---|---|---|---|---|
+| m1 | 7769 | 6 | 10517 | 10511 (generic) |
+| m2 | 6662 | 0 | 7741 | 7682 (bottomup) |
+| m4 | 7225 | 5 | 6871 | 6474 (topdown) |
+| m8 | 11830 | 20 | 16447* | 12860* (nosched) |
+| dynamic | 6650 (chose m2) | 0 | – | – |
+| dynamic + `-madjust-lmul-cost` | 6655 (m2) | 0 | – | – |
+| m8 + `-madjust-lmul-cost` | 11855 | 20 | – | – |
+
+\* LLVM m8 is from the earlier run in "Check with s279"; the other LLVM numbers were re-measured in
+the same session as the GCC runs.
+
+### `-madjust-lmul-cost` under `-mtune=generic-ooo`
+In the table above, `dynamic` and `m2` are the same assembly (6650 vs 6662 is run-to-run noise), and
+`-madjust-lmul-cost` changes nothing. The flag only acts in `riscv_sched_adjust_cost` (`riscv.cc`): it
+multiplies each vector instruction's scheduler latency by its LMUL (x2 m2, x4 m4, x8 m8, x0.5 mf2, ...),
+and only when tuning for `generic-ooo`. It does not change which LMUL is chosen, only the instruction
+order. With `-mtune=generic-ooo` (assembly in `stall/s279gcc/ooo_*.s`):
+
+| LMUL | generic-ooo | generic-ooo + `-madjust-lmul-cost` | vector spills/reloads |
+|---|---|---|---|
+| m2 | 6667 | 6732 (+1%) | 0 |
+| m4 | 7273 | 7445 (+2%) | 5 |
+| m8 | 12064 | **10913 (-10%)** | 20 |
+
+The latency scaling only helps at m8, where 20 spills/reloads make a better order matter. At m2 and m4
+it is slightly worse, which fits the stall tables above: the X60 does not have 8x the latency at m8.
+
+LLVM has no such flag. Its scheduling models already give LMUL-dependent latencies per CPU
+(`RISCVSchedSpacemitX60.td` with `-mcpu=spacemit-x60`); without `-mcpu` the generic model has no
+LMUL scaling. `-mrvv-max-lmul=dynamic` (keep the largest LMUL whose estimated live vector registers
+fit in 32) is closest to LLVM's loop vectorizer weighing register pressure under the
+`-riscv-v-register-bit-width-lmul` cap (`shouldConsiderVectorizationRegPressure`), which picks m4 for s279.
+
+### What a vector instruction's scheduler latency is
+The scheduler latency is the compiler's estimate of how many cycles pass between an instruction issuing
+and its result being ready for the next instruction that reads it. The instruction scheduler uses it to
+decide how far apart to place a producer and its consumer. It is a value written into the compiler's
+model, not something measured on the chip.
+
+```
+vle32.v  v8, (a0)      ; producer, latency 6
+vfadd.vv v16, v8, v8   ; consumer: if placed right after, waits ~6 cycles
+```
+
+If the model says `vle32` has latency 6, the scheduler tries to put about 6 cycles of independent
+instructions between the load and the `vfadd`. That is the same question the microbenchmarks here
+answer by measuring.
+
+GCC's `generic-ooo` model (`gcc/config/riscv/generic-vector-ooo.md`), excerpt:
+
+| class | latency |
+|---|---|
+| `vec_load` / `vec_store` | 6 |
+| `vec_alu` (vadd, ...) | 3 |
+| `vec_fadd` | 4 |
+| `vec_imul` | 4 |
+| `vec_fmul` (vfmul, vfmacc) | 6 |
+| `vec_mask` | 2 |
+| `vec_reduction` | 8 |
+| `vec_idiv`, `vec_float_divsqrt` | 16 |
+
+These values are the same for every LMUL. `-madjust-lmul-cost` multiplies them by LMUL, so `vfadd` at
+m8 becomes 4 x 8 = 32 cycles. That assumes an m8 instruction runs as 8 back-to-back m1 operations and
+the consumer waits for all of them.
+
+LLVM puts the same idea in its per-CPU scheduling models (`RISCVSched*.td`). With
+`-mcpu=spacemit-x60`, `RISCVSchedSpacemitX60.td` gives each instruction its own latency for each LMUL:
+for example, unit-stride loads stay constant up to m2 and then double, and whole-register load/store and
+`vmv<n>r` are 2 x LMUL. Without `-mcpu`, the generic model does not depend on LMUL.
+
+The board does not behave like latency x LMUL. A consumer can start on the first part of a register group
+before the producer has finished the rest (chaining), and at m4/m8 the producer's own long occupancy
+already hides the dependency. That is why the tables above show stalls only at m1/m2 (plus about 2
+cycles for mask compares) and almost none at m4/m8. So with `-madjust-lmul-cost`, a latency of 32 cycles
+at m8 overstates the real wait on the X60. That is why it only helped the m8 build with 20 spills,
+where reordering mattered, and made m2/m4 slightly slower.

@@ -21,6 +21,7 @@
 #include "llvm/CodeGen/PseudoSourceValue.h"
 #include "llvm/CodeGen/MachineConstantPool.h"
 #include "llvm/ADT/SmallBitVector.h"
+#include "llvm/ADT/SmallSet.h"
 #include <optional>
 
 using namespace llvm;
@@ -96,7 +97,8 @@ static bool isVectorReg(Register R, const MachineRegisterInfo &MRI) {
 // when sinking"): Vec when vector instructions are among them, Scalar when
 // they are all scalar. From m4 up there is no stall: each instruction keeps
 // its unit busy long enough to cover the latency, so the producer can sit
-// directly before the consumer.
+// directly before the consumer. Mask compares are the exception (see
+// isMaskCompareName).
 struct StallGap {
   unsigned Vec = 0, Scalar = 0;
 };
@@ -119,9 +121,30 @@ static unsigned pseudoLMul(const MCInstrDesc &Desc) {
   return Fractional ? 1 : LMul;
 }
 
-// LC / CC / CS / LS rows of the table, by the producer's LMUL.
+// Vector compares, which write one mask register at any LMUL. Measured with
+// vmslt.vv; the other integer and float compares are assumed to match.
+static bool isMaskCompareName(StringRef Name) {
+  for (StringRef P : {"PseudoVMSEQ", "PseudoVMSNE", "PseudoVMSLT", "PseudoVMSLE",
+                      "PseudoVMSGT", "PseudoVMFEQ", "PseudoVMFNE", "PseudoVMFLT",
+                      "PseudoVMFLE", "PseudoVMFGT", "PseudoVMFGE"})
+    if (Name.starts_with(P))
+      return true;
+  return false;
+}
+
+// No number of scalar instructions alone is known to cover the gap.
+static constexpr unsigned NoScalarGap = ~0u;
+
+// LC / CC / CS / LS rows of the table, by the producer's LMUL. A mask compare
+// stalls its consumer about 2 cycles at every LMUL, as the consumers of a mask
+// (mask ops, COPY to v0, v0.t-masked ops) are too short to hide it
+// (doc/DocStall.md, "Results: mask producer").
 static StallGap minStallGap(unsigned LMul, bool ProducerLoads,
-                            bool ConsumerStores, bool IntMul) {
+                            bool ConsumerStores, bool IntMul,
+                            bool MaskProducer = false) {
+  if (MaskProducer)
+    return LMul <= 1 ? StallGap{2, 12}
+                     : StallGap{LMul >= 4 ? 1u : 2u, NoScalarGap};
   if (LMul >= 4)
     return {0, 0};
   bool M1 = LMul <= 1;
@@ -156,14 +179,20 @@ static StallGap minStallGap(const MachineInstr &Producer,
   }
   bool IntMul = isIntMulName(TII.getName(Producer.getOpcode())) ||
                 isIntMulName(TII.getName(Consumer.getOpcode()));
-  StallGap Need =
-      minStallGap(LMul, Producer.mayLoad(), Consumer.mayStore(), IntMul);
-  LLVM_DEBUG(dbgs() << "  Stall gap: LMUL " << LMul << ", "
-                    << (Producer.mayLoad() ? "L" : "C")
-                    << (Consumer.mayStore() ? "S" : "C")
-                    << (IntMul ? " int mul" : "") << ", need " << Need.Vec
-                    << " vector / " << Need.Scalar << " scalar, producer "
-                    << TII.getName(Producer.getOpcode()) << "\n");
+  bool Mask = isMaskCompareName(TII.getName(Producer.getOpcode()));
+  StallGap Need = minStallGap(LMul, Producer.mayLoad(), Consumer.mayStore(),
+                              IntMul, Mask);
+  LLVM_DEBUG({
+    dbgs() << "  Min Stall gap: LMUL " << LMul << ", "
+           << (Mask ? "mask " : "") << (Producer.mayLoad() ? "L" : "C")
+           << (Consumer.mayStore() ? "S" : "C") << (IntMul ? " int mul" : "")
+           << ", need " << Need.Vec << " vector / ";
+    if (Need.Scalar == NoScalarGap)
+      dbgs() << "no scalar-only";
+    else
+      dbgs() << Need.Scalar << " scalar";
+    dbgs() << ", producer " << TII.getName(Producer.getOpcode()) << "\n";
+  });
   return Need;
 }
 
@@ -1063,8 +1092,9 @@ bool ExpandPseudos::ProcessRematLoads(MachineFunction &MF) {
     SmallVector<MachineInstr *, 8> Worklist;
     for (MachineInstr &MI : MBB) {
       StringRef Name = TII->getName(MI.getOpcode());
-      if (isWholeRegLoadName(Name) || isCheapALUOp(MI, Name))
+      if (isWholeRegLoadName(Name) || isCheapALUOp(MI, Name)) {
         Worklist.push_back(&MI);
+      }
     }
 
     while (!Worklist.empty()) {
@@ -1077,17 +1107,30 @@ bool ExpandPseudos::ProcessRematLoads(MachineFunction &MF) {
       if (!X.isVirtual() || !MRI->hasOneDef(X))
         continue;
 
-      // Every register read must be virtual with a single def, so its value
-      // is the same at the new position. Undef operands do not count.
+      // Every register read must be virtual, so its value can be tracked to the
+      // new position. Undef operands do not count. A register with several
+      // defs (tied defs after two-address) is accepted when all of them are in
+      // this block; it is checked below not to be redefined before the clone.
       SmallVector<Register, 4> Inputs;
+      SmallVector<Register, 2> MultiDefInputs;
       bool InputsOk = true;
       for (const MachineOperand &MO : Cand->all_uses()) {
         if (!MO.isReg() || MO.isUndef() || MO.getReg() == X)
           continue;
         Register R = MO.getReg();
-        if (!R.isVirtual() || !MRI->hasOneDef(R)) {
+        if (!R.isVirtual()) {
           InputsOk = false;
           break;
+        }
+        if (!MRI->hasOneDef(R)) {
+          if (any_of(MRI->def_instructions(R), [&](const MachineInstr &D) {
+                return D.getParent() != &MBB;
+              })) {
+            InputsOk = false;
+            break;
+          }
+          if (!is_contained(MultiDefInputs, R))
+            MultiDefInputs.push_back(R);
         }
         if (!is_contained(Inputs, R))
           Inputs.push_back(R);
@@ -1117,6 +1160,7 @@ bool ExpandPseudos::ProcessRematLoads(MachineFunction &MF) {
         return IsLoad && I.mayStore() && !isKnownNoAlias(I, *Cand);
       };
 
+      LLVM_DEBUG(dbgs() << "isCheapALU: " << *Cand);
       // Walk forward: look for the first use that is far from the previous.
       MachineInstr *PrevUse = nullptr;
       MachineInstr *Target = nullptr;
@@ -1163,10 +1207,47 @@ bool ExpandPseudos::ProcessRematLoads(MachineFunction &MF) {
         continue;
       MachineBasicBlock::iterator InsertPt = *GapPt;
 
+      // A multi-def input must still hold the value Cand read: no def of it
+      // between Cand and the clone.
+      bool Redefined = false;
+      for (Register R : MultiDefInputs)
+        for (auto It = std::next(Cand->getIterator()); It != InsertPt; ++It)
+          if (It->definesRegister(R, TRI)) {
+            LLVM_DEBUG(dbgs() << "Remat skipped, input " << printReg(R, TRI)
+                              << " redefined before target: " << *Cand);
+            Redefined = true;
+            break;
+          }
+      if (Redefined)
+        continue;
+
       // Only worth it if every input is live at the insertion point anyway.
       bool AllLive = true;
       for (Register R : Inputs) {
         bool Live = false;
+        if (is_contained(MultiDefInputs, R)) {
+          // Live if read at or after InsertPt before its next def (a tied def
+          // reads it first), or live out of the block if it is not redefined.
+          bool Killed = false;
+          for (auto It = InsertPt; It != MBB.end() && !Live && !Killed; ++It) {
+            if (It->isDebugInstr())
+              continue;
+            Live = It->readsRegister(R, TRI);
+            Killed = !Live && It->definesRegister(R, TRI);
+          }
+          if (!Live && !Killed)
+            Live = any_of(MRI->use_nodbg_instructions(R),
+                          [&](const MachineInstr &U) {
+                            return U.getParent() != &MBB;
+                          });
+          if (!Live) {
+            LLVM_DEBUG(dbgs() << "Remat skipped, input " << printReg(R, TRI)
+                              << " dies before target: " << *Cand);
+            AllLive = false;
+            break;
+          }
+          continue;
+        }
         for (MachineOperand &MO : MRI->use_nodbg_operands(R)) {
           MachineInstr *U = MO.getParent();
           if (U == Cand)
@@ -1184,15 +1265,14 @@ bool ExpandPseudos::ProcessRematLoads(MachineFunction &MF) {
             break;
         }
         if (!Live) {
+          LLVM_DEBUG(dbgs() << "Remat skipped, input " << printReg(R, TRI)
+                            << " dies before target: " << *Cand);
           AllLive = false;
           break;
         }
       }
-      if (!AllLive) {
-        LLVM_DEBUG(dbgs() << "Remat skipped, an input dies before target: "
-                          << *Cand);
+      if (!AllLive)
         continue;
-      }
 
       LLVM_DEBUG(dbgs() << "Remat " << *Cand << "  before " << *InsertPt
                         << "  for use " << *Target);
@@ -1730,6 +1810,8 @@ struct RevPlan {
     Flip,        // v = flip(Y) from Y = flip(v): the lane reverse again
     PermGather,  // v = gather(Y, inverse(p)) from Y = gather(v, p)
     Unshift,     // v = Y >> s from Y = v << s, v's top s bits known zero
+    UnshiftR,    // v = Y << s from Y = v >> s (logical or arithmetic), v's
+                 // low s bits known zero
     ZextNarrow,  // v = zext(Y) from Y = vnsrl(v, 0), v's top half known zero
   };
   KindTy Kind = Elementwise;
@@ -1765,6 +1847,8 @@ struct RevPlan {
   // PermGather of a self-inverse permutation (p = inverse(p), e.g. a swap of
   // blocks): the rebuild is the gather again with Q's own index, Ins[1].
   bool PermReuseIdx = false;
+  // PermGather reusing another index that holds the inverse permutation.
+  bool PermShared = false;
   unsigned dstOpcode() const { return Opcs.empty() ? Op.Opcode : Opcs.back(); }
   // Instructions the rebuild adds, roughly: a direct chain replays its
   // links, the others emit their opcodes and replay their clones.
@@ -1788,6 +1872,7 @@ static const char *planName(RevPlan::KindTy K) {
   case RevPlan::Flip: return "flip-of-flip";
   case RevPlan::PermGather: return "inverse-permutation-gather";
   case RevPlan::Unshift: return "srl-of-sll";
+  case RevPlan::UnshiftR: return "sll-of-srl";
   case RevPlan::ZextNarrow: return "zext-of-narrow";
   }
   return "?";
@@ -1911,34 +1996,43 @@ static bool vlCovers(const MachineOperand &Have, const MachineOperand &Need,
   return H && N && *H >= *N;
 }
 
-// The number of high bits known to be zero in each of the first VL elements
-// of R (VL being the operand VL), viewing the elements as Bits wide. A shift
-// left by s is undone by a shift right where R has s such bits, and vnsrl.wi
-// 0 by vzext.vf2 where the wide R has the upper half zero. Only R's unique
-// def is looked at, through copies, zero extensions, right shifts, ANDs with
-// a constant, splats of a constant and narrowing right shifts.
-static unsigned knownZeroHighBits(const TargetInstrInfo *TII,
-                                  const MachineRegisterInfo &MRI, Register R,
-                                  unsigned Bits, const MachineOperand &VL,
-                                  unsigned Depth = 0) {
+namespace {
+// Bits known to be zero at the top and at the bottom of every element.
+struct KnownZero {
+  unsigned High = 0, Low = 0;
+};
+} // namespace
+
+// The bits known to be zero in each of the first VL elements of R (VL being
+// the operand VL), viewing the elements as Bits wide. Where the bits a shift
+// drops are known zero, the shift is undone by the opposite one: a shift left
+// by s by a shift right where R has s zero high bits, a shift right by s by a
+// shift left where R has s zero low bits, and vnsrl.wi 0 by vzext.vf2 where
+// the wide R has the upper half zero. Only R's unique def is looked at,
+// through copies, extensions, shifts, ANDs, ORs and multiplies, splats of a
+// constant and narrowing right shifts.
+static KnownZero knownZeroBits(const TargetInstrInfo *TII,
+                               const MachineRegisterInfo &MRI, Register R,
+                               unsigned Bits, const MachineOperand &VL,
+                               unsigned Depth = 0) {
   if (!R.isVirtual() || Depth > 6)
-    return 0;
+    return {};
   const MachineInstr *D = MRI.getUniqueVRegDef(R);
   if (!D)
-    return 0;
+    return {};
   if (D->isCopy()) {
     const MachineOperand &Src = D->getOperand(1);
     if (Src.getSubReg() || D->getOperand(0).getSubReg())
-      return 0;
-    return knownZeroHighBits(TII, MRI, Src.getReg(), Bits, VL, Depth + 1);
+      return {};
+    return knownZeroBits(TII, MRI, Src.getReg(), Bits, VL, Depth + 1);
   }
   StringRef Name;
   if (!isPlainRVV(TII, *D, Name) || !hasUndefPassthru(*D) ||
       !vlCovers(vlOperand(*D), VL, MRI))
-    return 0;
+    return {};
   unsigned SEW = 1u << log2SEWOf(*D);
   if (SEW != Bits)
-    return 0;
+    return {};
   StringRef N = Name.drop_front(strlen("PseudoV"));
   auto ConstBits = [&](const MachineOperand &MO) -> std::optional<uint64_t> {
     std::optional<int64_t> C = constOperand(MO, MRI);
@@ -1946,48 +2040,92 @@ static unsigned knownZeroHighBits(const TargetInstrInfo *TII,
       return std::nullopt;
     return uint64_t(*C) & maskTrailingOnes<uint64_t>(SEW);
   };
-  auto Src = [&](unsigned Idx, unsigned SrcBits) {
+  // The known zeros of a constant; all SEW bits of 0.
+  auto OfConst = [&](uint64_t C) -> KnownZero {
+    if (!C)
+      return {SEW, SEW};
+    return {unsigned(countl_zero(C)) - (64 - SEW), unsigned(countr_zero(C))};
+  };
+  auto Src = [&](unsigned Idx, unsigned SrcBits) -> KnownZero {
     const MachineOperand &MO = D->getOperand(Idx);
     if (!MO.isReg() || MO.getSubReg())
-      return 0u;
-    return knownZeroHighBits(TII, MRI, MO.getReg(), SrcBits, VL, Depth + 1);
+      return {};
+    return knownZeroBits(TII, MRI, MO.getReg(), SrcBits, VL, Depth + 1);
+  };
+  // The second source: a register, or a constant of the .vx / .vi forms.
+  auto Second = [&]() -> KnownZero {
+    if (N.contains("_VV_"))
+      return Src(3, SEW);
+    if (std::optional<uint64_t> C = ConstBits(D->getOperand(3)))
+      return OfConst(*C);
+    return {};
+  };
+  auto Normalize = [&](KnownZero K) -> KnownZero {
+    if (K.High >= SEW || K.Low >= SEW) // the elements are all zero
+      return {SEW, SEW};
+    return K;
   };
 
-  // vzext.vf<n>: the top SEW - SEW/n bits.
-  if (N.starts_with("ZEXT_VF") && N.size() > 7 && isDigit(N[7]))
-    return SEW - SEW / (N[7] - '0');
-  // vsrl by s: s more zero bits on top of the source's.
-  if (N.starts_with("SRL_VI_") || N.starts_with("SRL_VX_")) {
-    std::optional<uint64_t> S = ConstBits(D->getOperand(3));
-    if (!S)
-      return 0;
-    uint64_t Sh = *S & (SEW - 1); // only log2(SEW) bits of the amount count
-    return std::min<uint64_t>(SEW, Src(2, SEW) + Sh);
+  // vzext.vf<n>: the top SEW - SEW/n bits, and the source's zeros.
+  // vsext.vf<n>: the same where the source's sign bit is known zero.
+  if ((N.starts_with("ZEXT_VF") || N.starts_with("SEXT_VF")) && N.size() > 7 &&
+      isDigit(N[7])) {
+    unsigned Narrow = SEW / (N[7] - '0');
+    KnownZero S = Src(2, Narrow);
+    if (N[0] == 'S' && !S.High)
+      return {0, S.Low};
+    return Normalize({SEW - Narrow + S.High, S.Low});
   }
-  // vand: the zeros of either source, or of the constant.
-  if (N.starts_with("AND_VI_") || N.starts_with("AND_VX_")) {
-    std::optional<uint64_t> C = ConstBits(D->getOperand(3));
-    unsigned FromC = C ? countl_zero(*C) - (64 - SEW) : 0;
-    return std::max(FromC, Src(2, SEW));
+  // Shifts by a constant s; only log2(SEW) bits of the amount count.
+  bool Srl = N.starts_with("SRL_VI_") || N.starts_with("SRL_VX_");
+  bool Sra = N.starts_with("SRA_VI_") || N.starts_with("SRA_VX_");
+  bool Sll = N.starts_with("SLL_VI_") || N.starts_with("SLL_VX_");
+  if (Srl || Sra || Sll) {
+    std::optional<uint64_t> Amt = ConstBits(D->getOperand(3));
+    if (!Amt)
+      return {};
+    unsigned Sh = *Amt & (SEW - 1);
+    KnownZero S = Src(2, SEW);
+    if (Sll) // s more zeros at the bottom, s fewer at the top
+      return Normalize({S.High > Sh ? S.High - Sh : 0, S.Low + Sh});
+    // vsrl shifts in zeros; vsra copies of the sign bit, zero only if it is.
+    unsigned High = Sra && !S.High ? 0 : S.High + Sh;
+    return Normalize({High, S.Low > Sh ? S.Low - Sh : 0});
   }
-  if (N.starts_with("AND_VV_"))
-    return std::max(Src(2, SEW), Src(3, SEW));
+  // vand: the zeros of either operand; vor: those of both.
+  if (N.starts_with("AND_V")) {
+    KnownZero A = Src(2, SEW), B = Second();
+    return Normalize({std::max(A.High, B.High), std::max(A.Low, B.Low)});
+  }
+  if (N.starts_with("OR_V")) {
+    KnownZero A = Src(2, SEW), B = Second();
+    return {std::min(A.High, B.High), std::min(A.Low, B.Low)};
+  }
+  // vmul: the low zeros of the two factors add up.
+  if (N.starts_with("MUL_VV_") || N.starts_with("MUL_VX_")) {
+    KnownZero A = Src(2, SEW), B = Second();
+    return Normalize({0, A.Low + B.Low});
+  }
   // vmv.v.i / vmv.v.x of a constant.
   if (N.starts_with("MV_V_I_") || N.starts_with("MV_V_X_")) {
     std::optional<uint64_t> C = ConstBits(D->getOperand(2));
-    return C ? countl_zero(*C) - (64 - SEW) : 0;
+    return C ? OfConst(*C) : KnownZero{};
   }
   // vnsrl.w[ix] by s: bits [s, s + SEW) of the 2*SEW bit source.
   if (N.starts_with("NSRL_WI_") || N.starts_with("NSRL_WX_")) {
-    std::optional<uint64_t> S = ConstBits(D->getOperand(3));
-    if (!S)
-      return 0;
-    uint64_t Sh = *S & (2 * SEW - 1);
-    uint64_t Wide = Src(2, 2 * SEW); // zero from bit 2*SEW - Wide up
-    uint64_t Top = 2 * SEW - Wide;   // the source's bits below that
-    return Top <= Sh ? SEW : SEW - std::min<uint64_t>(SEW, Top - Sh);
+    std::optional<uint64_t> Amt = ConstBits(D->getOperand(3));
+    if (!Amt)
+      return {};
+    unsigned Sh = *Amt & (2 * SEW - 1);
+    KnownZero W = Src(2, 2 * SEW);
+    if (W.High >= 2 * SEW)
+      return {SEW, SEW};
+    unsigned Top = 2 * SEW - W.High; // the source's bits from Top up are zero
+    unsigned High = Top <= Sh ? SEW : SEW - std::min(SEW, Top - Sh);
+    unsigned Low = W.Low > Sh ? std::min(SEW, W.Low - Sh) : 0;
+    return Normalize({High, Low});
   }
-  return 0;
+  return {};
 }
 
 // Lane reverse (tl.flip, a <n-1,...,1,0> shuffle). LLVM lowers it as
@@ -2163,6 +2301,80 @@ static std::optional<unsigned> constantPoolIndexOf(Register Addr,
   return Hi->getOperand(1).getIndex();
 }
 
+namespace {
+// A gather index loaded from the constant pool, holding a permutation p of
+// 0..n-1 in its first n elements.
+struct PermIndex {
+  MachineInstr *Load = nullptr, *Ext = nullptr;
+  const ConstantDataSequential *CDS = nullptr;
+  Align Alignment;
+  bool Signed = false;
+  SmallVector<int64_t, 64> Fwd; // p
+};
+} // namespace
+
+// If Idx is `vle<eew>(%const.k) [; vsext/vzext.vf2]` and its first N elements
+// are a permutation of 0..N-1, that permutation.
+static std::optional<PermIndex>
+decodePermIndex(const TargetInstrInfo *TII, const MachineRegisterInfo &MRI,
+                const MachineConstantPool &MCP, Register Idx, int64_t N) {
+  if (!Idx.isVirtual())
+    return std::nullopt;
+  PermIndex PI;
+  PI.Load = MRI.getUniqueVRegDef(Idx);
+  if (!PI.Load)
+    return std::nullopt;
+  StringRef EName;
+  if (isPlainRVV(TII, *PI.Load, EName) &&
+      (EName.starts_with("PseudoVSEXT_VF2_") ||
+       EName.starts_with("PseudoVZEXT_VF2_"))) {
+    std::optional<int64_t> ExtVL = constVL(vlOperand(*PI.Load), MRI);
+    if (!hasUndefPassthru(*PI.Load) || !ExtVL || *ExtVL < N)
+      return std::nullopt;
+    PI.Ext = PI.Load;
+    PI.Signed = EName.starts_with("PseudoVSEXT");
+    PI.Load = MRI.getUniqueVRegDef(PI.Ext->getOperand(2).getReg());
+    if (!PI.Load)
+      return std::nullopt;
+  }
+  MachineInstr *Load = PI.Load;
+  StringRef LName = TII->getName(Load->getOpcode());
+  if (!LName.starts_with("PseudoVLE") || !LName.contains("_V_") ||
+      LName.contains("FF") || LName.contains("MASK") ||
+      Load->getNumExplicitDefs() != 1 || !Load->getOperand(2).isReg() ||
+      !(Load->getOperand(1).isUndef() || !Load->getOperand(1).getReg()) ||
+      !Load->hasOneMemOperand())
+    return std::nullopt;
+  const PseudoSourceValue *PSV = (*Load->memoperands_begin())->getPseudoValue();
+  if (!PSV || PSV->kind() != PseudoSourceValue::ConstantPool)
+    return std::nullopt;
+  std::optional<int64_t> LoadVL = constVL(vlOperand(*Load), MRI);
+  std::optional<unsigned> CPI =
+      constantPoolIndexOf(Load->getOperand(2).getReg(), MRI);
+  if (!LoadVL || *LoadVL < N || !CPI || *CPI >= MCP.getConstants().size())
+    return std::nullopt;
+  const MachineConstantPoolEntry &E = MCP.getConstants()[*CPI];
+  if (E.isMachineConstantPoolEntry())
+    return std::nullopt;
+  PI.CDS = dyn_cast<ConstantDataSequential>(E.Val.ConstVal);
+  if (!PI.CDS || !PI.CDS->getElementType()->isIntegerTy() ||
+      PI.CDS->getNumElements() < uint64_t(N))
+    return std::nullopt;
+  PI.Alignment = E.getAlign();
+
+  // The first n indices must be a permutation of 0..n-1.
+  SmallVector<bool, 64> Seen(N, false);
+  for (int64_t I = 0; I != N; ++I) {
+    APInt V = PI.CDS->getElementAsAPInt(I);
+    int64_t P = PI.Signed ? V.getSExtValue() : int64_t(V.getZExtValue());
+    if (P < 0 || P >= N || Seen[P])
+      return std::nullopt;
+    Seen[P] = true;
+    PI.Fwd.push_back(P);
+  }
+  return PI;
+}
+
 // Permutation gather (a constant shuffle with every lane of v used once):
 //   idx = vle<eew>(%const.k) [; vsext/vzext.vf2]   ; a permutation p of 0..n-1
 //   y   = vrgather.vv / vrgatherei16.vv(v, idx)    ; y[i] = v[p[i]], VL n
@@ -2189,56 +2401,15 @@ static void matchPermPlan(const TargetInstrInfo *TII,
   if (!N || *N <= 0 || !Idx.isVirtual())
     return;
 
-  // idx = [vsext/vzext.vf2] (vle from the constant pool).
-  MachineInstr *Ext = nullptr, *Load = MRI.getUniqueVRegDef(Idx);
-  bool Signed = false;
-  if (!Load)
+  std::optional<PermIndex> PI = decodePermIndex(TII, MRI, MCP, Idx, *N);
+  if (!PI)
     return;
-  StringRef EName;
-  if (isPlainRVV(TII, *Load, EName) &&
-      (EName.starts_with("PseudoVSEXT_VF2_") ||
-       EName.starts_with("PseudoVZEXT_VF2_"))) {
-    if (!hasUndefPassthru(*Load))
-      return;
-    Ext = Load;
-    Signed = EName.starts_with("PseudoVSEXT");
-    Load = MRI.getUniqueVRegDef(Ext->getOperand(2).getReg());
-    if (!Load)
-      return;
-  }
-  StringRef LName = TII->getName(Load->getOpcode());
-  if (!LName.starts_with("PseudoVLE") || !LName.contains("_V_") ||
-      LName.contains("FF") || LName.contains("MASK") ||
-      Load->getNumExplicitDefs() != 1 || !Load->getOperand(2).isReg() ||
-      !(Load->getOperand(1).isUndef() || !Load->getOperand(1).getReg()) ||
-      !Load->hasOneMemOperand())
-    return;
-  const PseudoSourceValue *PSV = (*Load->memoperands_begin())->getPseudoValue();
-  if (!PSV || PSV->kind() != PseudoSourceValue::ConstantPool)
-    return;
-  std::optional<int64_t> LoadVL = constVL(vlOperand(*Load), MRI);
-  std::optional<unsigned> CPI =
-      constantPoolIndexOf(Load->getOperand(2).getReg(), MRI);
-  if (!LoadVL || *LoadVL < *N || !CPI || *CPI >= MCP.getConstants().size())
-    return;
-  const MachineConstantPoolEntry &E = MCP.getConstants()[*CPI];
-  if (E.isMachineConstantPoolEntry())
-    return;
-  const auto *CDS = dyn_cast<ConstantDataSequential>(E.Val.ConstVal);
-  if (!CDS || !CDS->getElementType()->isIntegerTy() ||
-      CDS->getNumElements() < uint64_t(*N))
-    return;
-
-  // The first n indices must be a permutation of 0..n-1.
-  SmallVector<int64_t, 64> Inv(*N, -1), Fwd(*N);
-  for (int64_t I = 0; I != *N; ++I) {
-    APInt V = CDS->getElementAsAPInt(I);
-    int64_t P = Signed ? V.getSExtValue() : int64_t(V.getZExtValue());
-    if (P < 0 || P >= *N || Inv[P] >= 0)
-      return;
-    Inv[P] = I;
-    Fwd[I] = P;
-  }
+  MachineInstr *Load = PI->Load, *Ext = PI->Ext;
+  const ConstantDataSequential *CDS = PI->CDS;
+  const SmallVector<int64_t, 64> &Fwd = PI->Fwd;
+  SmallVector<int64_t, 64> Inv(*N);
+  for (int64_t I = 0; I != *N; ++I)
+    Inv[Fwd[I]] = I;
   SmallVector<Constant *, 64> Elts;
   for (unsigned I = 0, NE = CDS->getNumElements(); I != NE; ++I)
     Elts.push_back(I < uint64_t(*N)
@@ -2258,7 +2429,7 @@ static void matchPermPlan(const TargetInstrInfo *TII,
   P.FlipSrc = VIn;
   P.FlipIdx = Idx;
   P.PermInv = ConstantVector::get(Elts);
-  P.PermAlign = E.getAlign();
+  P.PermAlign = PI->Alignment;
   P.Opcs = {Q.getOpcode()};
   unsigned QPos = BM.Pos.lookup(&Q);
   P.Ins.push_back({Q.getOperand(0).getReg(), QPos + 1, {{Q.getOpcode(), 0}}});
@@ -2272,23 +2443,47 @@ static void matchPermPlan(const TargetInstrInfo *TII,
                  : 0);
   Out.push_back(P);
 
-  // A self-inverse permutation (every butterfly step of a reduction: a swap
-  // of two blocks) is undone by the same gather, so the rebuild can read Q's
-  // own index instead of loading a new one: one instruction. The index is
-  // then an input like y, and must be live where the rebuild goes.
-  if (Fwd == Inv) {
-    RevPlan R;
-    R.Kind = RevPlan::PermGather;
-    R.PermReuseIdx = true;
-    R.Fwd.push_back(&Q);
-    R.Clone.push_back(&Q);
-    R.FlipSrc = VIn;
-    R.FlipIdx = Idx;
-    R.Opcs = {Q.getOpcode()};
-    R.Ins.push_back({Q.getOperand(0).getReg(), QPos + 1, {{Q.getOpcode(), 0}}});
-    R.Ins.push_back({Idx, QPos, {{Q.getOpcode(), 3}}});
-    R.Valid = P.Valid;
-    Out.push_back(R);
+  // An index register that already holds q makes the rebuild one gather
+  // reading it, instead of loading q again. Q's own index does when p is
+  // self-inverse (every butterfly step of a reduction: a swap of two blocks).
+  // Any other index of a gather of the same kind does when it was loaded
+  // from a table holding q: one an earlier rebuild loaded, or one the program
+  // uses for the opposite shuffle. The index is then an input like y, and
+  // must be live where the rebuild goes.
+  auto AddReuse = [&](Register R, unsigned From) {
+    RevPlan RP;
+    RP.Kind = RevPlan::PermGather;
+    RP.PermReuseIdx = true;
+    RP.PermShared = R != Idx;
+    RP.Fwd.push_back(&Q);
+    RP.Clone.push_back(&Q);
+    RP.FlipSrc = VIn;
+    RP.FlipIdx = Idx;
+    RP.Opcs = {Q.getOpcode()};
+    RP.Ins.push_back({Q.getOperand(0).getReg(), QPos + 1, {{Q.getOpcode(), 0}}});
+    RP.Ins.push_back({R, From, {{Q.getOpcode(), 3}}});
+    RP.Valid = P.Valid;
+    Out.push_back(RP);
+  };
+  if (Fwd == Inv)
+    AddReuse(Idx, QPos);
+  SmallSet<Register, 8> Tried;
+  Tried.insert(Idx);
+  for (MachineInstr *G : BM.Instrs) {
+    if (G->getOpcode() != Q.getOpcode() || !G->getOperand(3).isReg() ||
+        G->getOperand(3).getSubReg())
+      continue;
+    Register R = G->getOperand(3).getReg();
+    if (!Tried.insert(R).second)
+      continue;
+    std::optional<PermIndex> Other = decodePermIndex(TII, MRI, MCP, R, *N);
+    if (!Other || Other->Fwd != Inv)
+      continue;
+    auto It = BM.Regs.find(R);
+    unsigned From =
+        It == BM.Regs.end() || It->second.Defs.empty() ? 0
+                                                       : It->second.Defs.back() + 1;
+    AddReuse(R, From);
   }
 }
 
@@ -2585,13 +2780,35 @@ static void matchGroupPlans(const TargetInstrInfo *TII,
     unsigned Srl =
         Opcode(Twine("PseudoVSRL_") + amountForm(Q.getOperand(3)) + L);
     if (S && *S > 0 && *S < int64_t(SEW) && Srl &&
-        knownZeroHighBits(TII, MRI, VIn, SEW, vlOperand(Q)) >= *S) {
+        knownZeroBits(TII, MRI, VIn, SEW, vlOperand(Q)).High >= *S) {
       RevPlan P;
       P.Kind = RevPlan::Unshift;
       P.Fwd = {&Q};
       P.Ins.push_back({QDst, QPos + 1, {{Srl, 2}}});
       P.Opcs = {Srl};
       P.Valid = makeRange(vlOperand(Q), Log2SEW, TII->get(Srl), SEW);
+      Out.push_back(P);
+    }
+  }
+
+  // Shift right by a constant s alone, logical or arithmetic: v = Y << s
+  // where the low s bits of v are known zero. The bits shifted in at the top
+  // (zeros or sign copies) are shifted back out.
+  if (VIsSrc &&
+      (N.starts_with("SRL_VI_") || N.starts_with("SRL_VX_") ||
+       N.starts_with("SRA_VI_") || N.starts_with("SRA_VX_")) &&
+      hasUndefPassthru(Q)) {
+    std::optional<int64_t> S = constOperand(Q.getOperand(3), MRI);
+    unsigned Sll =
+        Opcode(Twine("PseudoVSLL_") + amountForm(Q.getOperand(3)) + L);
+    if (S && *S > 0 && *S < int64_t(SEW) && Sll &&
+        knownZeroBits(TII, MRI, VIn, SEW, vlOperand(Q)).Low >= *S) {
+      RevPlan P;
+      P.Kind = RevPlan::UnshiftR;
+      P.Fwd = {&Q};
+      P.Ins.push_back({QDst, QPos + 1, {{Sll, 2}}});
+      P.Opcs = {Sll};
+      P.Valid = makeRange(vlOperand(Q), Log2SEW, TII->get(Sll), SEW);
       Out.push_back(P);
     }
   }
@@ -2603,7 +2820,7 @@ static void matchGroupPlans(const TargetInstrInfo *TII,
       SEW < 64) {
     unsigned Zext = Opcode("PseudoVZEXT_VF2_" + doubleLMul(L));
     if (Zext &&
-        knownZeroHighBits(TII, MRI, VIn, 2 * SEW, vlOperand(Q)) >= SEW) {
+        knownZeroBits(TII, MRI, VIn, 2 * SEW, vlOperand(Q)).High >= SEW) {
       RevPlan P;
       P.Kind = RevPlan::ZextNarrow;
       P.Fwd = {&Q};
@@ -2917,7 +3134,8 @@ bool ExpandPseudos::ProcessReverseRematChain(MachineFunction &MF) {
             DstLMul ? DstLMul : Weight(V), DstDesc.mayLoad(),
             Consumer.mayStore(),
             isIntMulName(TII->getName(Plan.dstOpcode())) ||
-                isIntMulName(TII->getName(Consumer.getOpcode())));
+                isIntMulName(TII->getName(Consumer.getOpcode())),
+            isMaskCompareName(TII->getName(Plan.dstOpcode())));
         LLVM_DEBUG(dbgs() << "  Stall gap: LMUL "
                           << (DstLMul ? DstLMul : Weight(V)) << ", "
                           << (DstDesc.mayLoad() ? "L" : "C")
@@ -2950,8 +3168,10 @@ bool ExpandPseudos::ProcessReverseRematChain(MachineFunction &MF) {
                 }))
               continue;
             // A scalar may be kept alive a bit longer; it does not count
-            // against the vector registers.
-            if (!A.W)
+            // against the vector registers. So may a shared inverse index
+            // lighter than v: its last use is the earlier rebuild that loaded
+            // it, and keeping it to this site saves a reload of q.
+            if (!A.W || (Plan.PermShared && I == 1 && A.W < Weight(V)))
               A.Last = Model::Inf;
             Alts[I].push_back(A);
           }
@@ -3100,7 +3320,9 @@ bool ExpandPseudos::ProcessReverseRematChain(MachineFunction &MF) {
             MRI->constrainRegClass(Best.In[I].Reg, RC);
 
       LLVM_DEBUG(dbgs() << "ReverseRemat[" << planName(Plan.Kind)
-                        << (Plan.PermReuseIdx ? ", self-inverse" : "")
+                        << (Plan.PermShared     ? ", shared-index"
+                            : Plan.PermReuseIdx ? ", self-inverse"
+                                                : "")
                         << (Plan.Exact ? "" : ", rounded")
                         << "]: recompute " << printReg(V, TRI) << " from "
                         << printReg(In0, TRI);
@@ -3277,7 +3499,8 @@ bool ExpandPseudos::ProcessReverseRematChain(MachineFunction &MF) {
         AddVLSEWPolicy(Up, UpFirst ? *Q : *W);
         break;
       }
-      case RevPlan::Unshift: {
+      case RevPlan::Unshift:
+      case RevPlan::UnshiftR: {
         MachineInstrBuilder MIB = Build(Plan.Opcs[0], NewV);
         MIB.addReg(NewV, RegState::Undef)
             .addReg(In0)
@@ -3686,7 +3909,7 @@ bool ExpandPseudos::runOnMachineFunction(MachineFunction &MF) {
   bool AnyFlag = Sink || Affine || Remat || Reverse || Copy;
   if (!AnyFlag) {
     dbgs()<<"Custom Sink disabled.\n";
-  } else if (Sink) {
+  } else {
     std::string option = "";
     if (Sink) option += " Sink";
     if (Copy) option += " Copy";
