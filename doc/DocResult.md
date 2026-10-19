@@ -1,23 +1,101 @@
-# Results on the reverse kernels (`llc`)
+# Triton tutorials
 
-`llc -O3 -verify-machineinstrs` on the `dump2/base` `.llir` kernels. Max VP and SLIL are the pass's own LMUL-weighted numbers before and after its transforms (32 vector registers). Spills and reloads are `Folded Spill` / `Folded Reload` in the assembly.
+CPU tutorials (have a version in `python/tutorials/cpu/`):
 
-"none" is a true baseline: without a `--custom-*` flag the pass changes nothing. The COPY-to-VMV lowering (`LowerCopy`, see `DocSink.md`) is its own flag, `--custom-copy` (7, 3, 3 and 3 copies here). The table measures `--custom-reverse --custom-copy`; the last columns give each flag alone.
+| tutorial | kernels |
+|---|---|
+| 01 vector-add | `add_kernel` |
+| 02 fused-softmax | `softmax_kernel` |
+| 03 matrix-multiplication | `matmul_kernel` |
+| 04 blocked-matmul | `matmul_kernel` (row-major and blocked), `block_transpose_combined_kernel` |
+| 05 layer-norm | `_layer_norm_fwd_fused`, `_layer_norm_bwd_dx_fused`, `_layer_norm_bwd_dwdb` |
+| 06 matrix-vector-multiplication | `gemv_kernel` |
+| 07 matrix-vector-multiplication-bf16 | `gemv_kernel` |
+| 08 sfc-matmul | `block_transpose_pack_kernel`, `sfc_kernel` |
 
-| kernel | none: max VP | none: spills / reloads | `--custom-reverse --custom-copy`: max VP | SLIL | spills / reloads | fires | `--custom-reverse` alone | `--custom-copy` alone |
-|---|---|---|---|---|---|---|---|---|
-| `reverse_v1` | 84 | 19 / 26 | 84 → 84 | 2785 → 2857 | 16 / 20 | 2 elementwise | 22 / 31 | 16 / 22 |
-| `reverse_v2` | 75 | 15 / 17 | 75 → 67 | 3061 → 2899 | **9 / 9** | 8 elementwise | 10 / 10 | 15 / 17 |
-| `reverse_v3` | 108 | 18 / 21 | 108 → 92 | 3575 → 3875 | **14 / 18** | 4 direct (2- and 3-step) | 18 / 23 | 17 / 22 |
-| `reverse_v4` | 140 | 26 / 27 | 140 → 92 | 4316 → 4896 | **18 / 23** | 6 direct (2- and 3-step) | 22 / 28 | 23 / 25 |
+GPU-only tutorials (only in `python/tutorials/`):
 
-The remats are the same with or without `--custom-copy`, but the spills depend on both together: on `reverse_v1`, `--custom-reverse` alone is worse than none (22 / 31 against 19 / 26), and `--custom-reverse --custom-copy` reaches 16 / 20.
+| tutorial | kernels |
+|---|---|
+| 04 low-memory-dropout | `_dropout`, `_seeded_dropout` |
+| 06 fused-attention | `_attn_fwd` |
+| 07 extern-functions | `asin_kernel` |
+| 08 grouped-gemm | `grouped_matmul_kernel` |
+| 09 persistent-matmul | `matmul_kernel`, `matmul_kernel_persistent`, `matmul_kernel_descriptor_persistent` |
+| 10 block-scaled-matmul | `block_scaled_matmul_kernel` |
 
-The former `--custom-forward` reached 14 / 18 on `reverse_v3` and 19 / 24 on `reverse_v4`. The multi-step direct options reproduce the first and do slightly better on the second, because they can also replay the multiply (3 steps). Before the direct options were extended, `--custom-reverse` fired nothing on `reverse_v3` and `reverse_v4`: their direct options were single-step and their inputs dead, and the multiply that follows has no inverse.
+# Results on Liger-Kernel (board)
 
-On `reverse_v1`, the 2 elementwise remats free a register for only about 5 instructions, so max VP is unchanged and the small change in reloads is the register allocator reacting to slightly different live ranges.
+29 Triton kernels of 16 Liger-Kernel ops (`~/Liger-Kernel`, `src/liger_kernel/ops/`), each wrapped in an `rvv_liger_<op>_elf.py` harness (triton-cpu `python/tutorials/cpu/`) that imports the kernel from Liger, checks it against a torch reference and runs it on the board. They are compiled through Triton (`TRITON_RISCV_LMUL=8`, flags via `TRITON_RISCV_LLVM_ARGS`, `-verify-machineinstrs`), without `--custom-*` flags (baseline) and with all of them (`--custom-copy --custom-sink --custom-affine --custom-remat --custom-reverse`). Max VP is `ExpandPseudos`' own number before → after its transforms; spills and reloads are `Folded Spill` / `Folded Reload` in the kernel's assembly; fires are the pass's debug lines (`lowerCopy`, sink success, `Affine:`, `Remat`, `ReverseRemat[`). fp32, small shapes (8 or 16 rows of 500 columns, a vocabulary of 1000), with irregular sizes so the masked tails are tested.
 
-All runs pass `-verify-machineinstrs`, and `--custom-reverse` alone gives the same assembly as `--custom-reverse --custom-remat` on all four kernels. On `s279.mir` (checked with `-run-pass=expandpseudos -verify-machineinstrs`), `--custom-reverse` alone runs the redundant-reload removal and one load remat, the same MIR as `--custom-remat --custom-reverse`; no reverse remat fires there. (`llc -start-before=expandpseudos s279.mir` crashes in the RISC-V assembly printer with an invalid register even without any flag, so `s279` cannot be checked through to assembly that way.)
+| kernel | config | max VP | spills / reloads | fires | board |
+|---|---|---|---|---|---|
+| `rms-norm-fwd` | baseline | 137 | 31 / 42 | — | PASS 0.0104 ms |
+|  | all | 137 → 137 | 26 / 32 | 15 copies, 7 affine | PASS 0.0098 ms |
+| `rms-norm-bwd` | baseline | 328 | 84 / 118 | — | PASS 0.0283 ms |
+|  | all | 328 → 272 | 84 / 123 | 7 affine, 8 reverse remats | PASS 0.0319 ms |
+| `layer-norm-fwd` | baseline | 266 | 47 / 57 | — | PASS 0.0142 ms |
+|  | all | 266 → 266 | 47 / 55 | 24 copies, 1 sink, 7 affine | PASS 0.0135 ms |
+| `layer-norm-bwd` | baseline | 336 | 122 / 167 | — | PASS 0.0346 ms |
+|  | all | 336 → 320 | 122 / 173 | 7 affine, 9 reverse remats | PASS 0.0397 ms |
+| `fused-add-rms-norm-fwd` | baseline | 145 | 45 / 60 | — | PASS 0.0552 ms |
+|  | all | 145 → 145 | 40 / 60 | 23 copies, 7 affine | PASS 0.081 ms |
+| `fused-add-rms-norm-bwd` | baseline | 336 | 96 / 134 | — | PASS 0.037 ms |
+|  | all | 336 → 328 | 96 / 149 | 7 affine, 9 reverse remats | PASS 0.1221 ms |
+| `poly-norm-fwd` | baseline | 226 | 49 / 76 | — | PASS 0.0136 ms |
+|  | all | 226 → 184 | 46 / 74 | 7 copies, 7 affine, 8 reverse remats | PASS 0.0143 ms |
+| `poly-norm-bwd` | baseline | 361 | 120 / 207 | — | PASS 0.0482 ms |
+|  | all | 361 → 361 | 124 / 201 | 15 copies, 7 affine, 10 reverse remats | PASS 0.0402 ms |
+| `group-norm-fwd` | baseline | 361 | 175 / 219 | — | PASS 0.0147 ms |
+|  | all | 361 → 354 | 158 / 203 | 7 copies, 1 sink, 15 affine, 15 reverse remats | PASS 0.0149 ms |
+| `group-norm-bwd` | baseline | 57 | 59 / 80 | — | PASS 0.0178 ms |
+|  | all | 57 → 43 | 53 / 73 | 4 copies, 12 sinks, 4 reverse remats | PASS 0.0488 ms |
+| `dyt-fwd` | baseline | 200 | 54 / 182 | — | PASS 0.1907 ms |
+|  | all | 200 → 200 | 59 / 187 | 23 copies, 16 affine | PASS 0.0771 ms |
+| `dyt-bwd` | baseline | 337 | 174 / 340 | — | PASS 0.1845 ms |
+|  | all | 337 → 337 | 174 / 340 | — | PASS 0.1772 ms |
+| `swiglu-fwd` | baseline | 195 | 42 / 163 | — | PASS 0.0321 ms |
+|  | all | 195 → 193 | 41 / 162 | 3 sinks, 8 reverse remats | PASS 0.0357 ms |
+| `swiglu-bwd` | baseline | 266 | 79 / 209 | — | PASS 0.038 ms |
+|  | all | 266 → 266 | 78 / 209 | 1 copy, 3 sinks, 8 reverse remats | PASS 0.0357 ms |
+| `geglu-fwd` | baseline | 195 | 43 / 174 | — | PASS 0.0792 ms |
+|  | all | 195 → 195 | 43 / 172 | 5 sinks | PASS 0.0941 ms |
+| `geglu-bwd` | baseline | 394 | 94 / 251 | — | PASS 0.0427 ms |
+|  | all | 394 → 394 | 94 / 249 | 1 copy, 5 sinks | PASS 0.0478 ms |
+| `relu-squared-fwd` | baseline | 65 | 5 / 5 | — | PASS 0.0025 ms |
+|  | all | 65 → 65 | 5 / 5 | — | PASS 0.0289 ms |
+| `relu-squared-bwd` | baseline | 113 | 15 / 15 | — | PASS 0.0291 ms |
+|  | all | 113 → 113 | 14 / 14 | 4 sinks | PASS 0.0044 ms |
+| `softmax-fwd` | baseline | 96 | 50 / 180 | — | PASS 0.0833 ms |
+|  | all | 96 → 96 | 45 / 173 | 7 copies, 7 affine | PASS 0.0304 ms |
+| `softmax-bwd` | baseline | 152 | 25 / 40 | — | PASS 0.0369 ms |
+|  | all | 152 → 152 | 24 / 37 | 15 copies, 7 affine | PASS 0.0341 ms |
+| `sparsemax-fwd` | baseline | 321 | 181 / 246 | — | PASS 0.0582 ms |
+|  | all | 321 → 321 | 187 / 247 | 14 copies, 7 affine, 4 reverse remats | PASS 0.0601 ms |
+| `sparsemax-bwd` | baseline | 154 | 72 / 75 | — | PASS 0.0574 ms |
+|  | all | 154 → 137 | 66 / 67 | 39 copies, 9 sinks, 16 affine | PASS 0.0381 ms |
+| `rope-fwd` | baseline | 68 | 9 / 11 | — | PASS 0.0281 ms |
+|  | all | 68 → 68 | 9 / 10 | 8 sinks | PASS 0.027 ms |
+| `rope-bwd` | baseline | 68 | 9 / 11 | — | PASS 0.0262 ms |
+|  | all | 68 → 68 | 9 / 10 | 8 sinks | PASS 0.0367 ms |
+| `cross-entropy` | baseline | 184 | 168 / 663 | — | PASS 0.2838 ms |
+|  | all | 184 → 168 | 155 / 648 | 30 copies, 1 sink, 48 affine, 5 remats | PASS 0.259 ms |
+| `kl-div-fwd` | baseline | 202 | 51 / 180 | — | PASS 0.0854 ms |
+|  | all | 202 → 168 | 49 / 183 | 15 copies, 8 affine, 8 reverse remats | PASS 0.0952 ms |
+| `kl-div-bwd` | baseline | 103 | 16 / 17 | — | PASS 0.0378 ms |
+|  | all | 103 → 81 | 8 / 8 | 7 copies, 8 affine | PASS 0.11 ms |
+| `jsd` | baseline | 354 | 152 / 856 | — | PASS 0.406 ms |
+|  | all | 354 → 338 | 151 / 854 | 15 copies, 8 affine | PASS 0.4642 ms |
+| `tvd` | baseline | 216 | 54 / 86 | — | PASS 0.0428 ms |
+|  | all | 216 → 216 | 50 / 83 | 15 copies, 8 affine | PASS 0.1428 ms |
+
+- All 29 kernels pass on the board in both configs.
+- In total, spills / reloads go from 2121 / 4864 to 2057 / 4801 (−3% / −1%). The fires are 277 copies, 204 affine, 91 reverse remats, 60 sinks and 5 remats.
+- `--custom-reverse` fires on 11 kernels, 91 times: every norm backward kernel (rms, layer, fused add + rms, poly, group), poly-norm and group-norm forward, swiglu forward and backward, sparsemax forward and kl-div forward. It lowers max VP in 8 of them (e.g. rms-norm-bwd 328 → 272, poly-norm-fwd 226 → 184, kl-div-fwd 202 → 168), but spills follow only in group-norm (fwd 175 / 219 → 158 / 203, bwd 59 / 80 → 53 / 73) and poly-norm-fwd (49 / 76 → 46 / 74). In rms-, layer- and fused-add-rms-norm backward the spills stay the same and the reloads rise (118 → 123, 167 → 173, 134 → 149): max VP falls at one point, but the allocator spills the same values elsewhere.
+- The largest spill reductions come from the other flags: kl-div-bwd 16 / 17 → 8 / 8 and sparsemax-bwd 72 / 75 → 66 / 67 (copies, sinks, affine, no reverse remat), cross-entropy 168 / 663 → 155 / 648 (copies, affine, 5 remats).
+- Nothing fires in dyt-bwd and relu-squared-fwd. The board times are single runs of 100 launches and are noisy: relu-squared-fwd, with no fires, measured 0.0025 ms and 0.0289 ms. So the times do not compare the configurations.
+- Kernels that write over their inputs (swiglu-bwd, geglu-bwd, rope, cross-entropy) or accumulate into their outputs (group-norm-bwd, atomic adds) are checked after a single launch and timed in a second run without a check.
+- Left out: Liger's multi-block softmax kernels, which start from `tl.float32(-float("inf"))`, which this Triton's frontend rejects (`'dtype' object is not callable`). group-norm-bwd's float atomic add becomes a call to libatomic (`__atomic_load_4`), which the kernel `.so` is not linked against; its harness links the runner with `-latomic` so the board can load it. Not covered: the MoE, attention, mHC, GRPO, mRoPE / Llama4 RoPE, multi-token-attention and fused-linear kernels, and the tiled / fused gate-up variants of SwiGLU and the block RMSNorm.
 
 # Results on the lqcd and paper tutorials (board)
 

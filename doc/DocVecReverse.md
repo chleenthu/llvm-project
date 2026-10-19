@@ -75,17 +75,17 @@ The first `n` entries of the constant must be a permutation of `0..n-1`. Its inv
 
 ### Reload rebuild
 
-`q` is written to a new constant-pool entry and loaded like the original index:
+`q` is written to the constant pool and loaded like the original index:
 
 ```text
-auipc  t, %pcrel_hi(new entry)
-addi   t, t, %pcrel_lo(...)
+auipc  t, %pcrel_hi(.LCPI0_1)
+addi   t, t, %pcrel_lo(.Lpcrel_hi0)
 vle8.v      i8, (t)
 vsext.vf2   i16, i8
 vrgatherei16.vv  v', y, i16
 ```
 
-That is 5 instructions (4 without the extension), and a new constant per remat.
+That is 5 instructions (4 without the extension). Identical inverse tables share one constant-pool entry, since `getConstantPoolIndex` returns the existing index for an equal constant, but each reload rebuild loads the table again.
 
 ### Self-inverse rebuild
 
@@ -96,6 +96,37 @@ vrgatherei16.vv  v', y, idx         ; idx is the original gather's index
 ```
 
 Every block swap is self-inverse, so this covers each butterfly step of a reduction. `matchPermPlan` then offers a second plan that takes `idx` as an input, alongside `y`. The site check treats `idx` like any other input, so this plan only qualifies where `idx` is still live (or dies right before the site). Where both qualify, it wins on instruction count. `-debug-only=expandpseudos` labels it `ReverseRemat[inverse-permutation-gather, self-inverse]`.
+
+### Shared-index rebuild
+
+The self-inverse rebuild reuses a register that already holds `q`. That register need not be the original index: an earlier reload rebuild leaves `q` loaded, and the program itself may gather by `q` for the opposite shuffle. `matchPermPlan` scans the block for gathers with the same opcode as `Q`, decodes each one's index with `decodePermIndex` (a constant-pool load, optionally extended, whose first `n` entries are a permutation), and offers a one-gather plan for every index that holds `q`:
+
+```text
+vrgatherei16.vv  v', y, qidx        ; qidx: any index register holding q
+```
+
+The plan's inputs are `y` and `qidx`, with `qidx` valid from just after its def. `-debug-only=expandpseudos` labels it `ReverseRemat[inverse-permutation-gather, shared-index]`.
+
+An index loaded by an earlier rebuild is last read by that rebuild's gather, which comes before the new site. Under the usual site rule (`P = min(PGap, Last + 1)`), the shared plan would sit before the reload plan's site and lose on "latest `P`". So a shared index may stay live past its last use, like a scalar input, when its pressure weight is less than `v`'s. Keeping a light index live for a few more instructions costs less than reloading `q`. This applies only to shared indices; the self-inverse plan still requires its index to be live at the site.
+
+Test `~/tsvc/perm_shared.ll`: two `<16 x i32>` values (LMUL 4) are shuffled by the same Gray-code permutation `p = [0,1,3,2,6,7,5,4,12,13,15,14,10,11,9,8]`, which is not self-inverse, and both are used again late. `llc -mtriple=riscv64 -mattr=+v,+m -relocation-model=pic`:
+
+| flags | spills + reloads | instructions | rebuilds |
+|---|---|---|---|
+| none | 14 | 142 | - |
+| `--custom-reverse` | 10 | 126 | 1 reload (5 instructions), 1 shared-index (1 instruction) |
+
+```text
+auipc  a0, %pcrel_hi(.LCPI0_1)        ; q = [0,1,3,2,7,6,4,5,15,14,12,13,8,9,11,10]
+addi   a0, a0, %pcrel_lo(.Lpcrel_hi1)
+vle8.v           v24, (a0)
+vsext.vf2        v28, v24
+vrgatherei16.vv  v24, v8, v28         ; x1' = y1[q]   (reload)
+vadd.vv          v16, v16, v24
+vrgatherei16.vv  v24, v12, v28        ; x2' = y2[q]   (shared-index, reuses v28)
+```
+
+Without the shared index, the second rebuild repeats the 5-instruction reload of the same `.LCPI0_1`. The test needs `-relocation-model=pic`; see Limitations. It has not been run on QEMU or the board.
 
 ## Results on 07 (BF16 GEMV)
 
@@ -134,7 +165,7 @@ Before and after the self-inverse rebuild:
 |---|---|---|
 | remats | 41, all reload a new table (5 instructions) | 41: 12 self-inverse (1 instruction), 29 reload |
 | loop instructions | 511 -> 716 | 511 -> 668 |
-| new constant-pool tables | 41 | 29 |
+| inverse-table loads | 41 | 29 |
 
 The 12 self-inverse sites are those where the index table is still read by a later row's gather. At the other 29 the index has died, and reusing it would extend it, so the reload plan is used there.
 
@@ -272,138 +303,47 @@ Test `~/tsvc/known_zero_low.ll`, for `sll-of-srl`:
 
 None of these has been run on QEMU or the board.
 
-## Which Triton op can be reversed
+## Reshape (`tl.reshape`)
 
-### Non-Elementwise Ops That Can Be Reversed
+`rvv_reshape_elf.py` has two kernels on 64 x i32 (LMUL 8, no `--custom-*` flags for the IR below):
 
-| Group | Lowered to | Rebuild of the source | status |
-|---|---|---|---|
-| Lane rotation (slides) | `vslidedown k` ; `vslideup n-k`, or `vslideup k` ; `vslidedown n-k` at VL `k`, tail undisturbed | inverse slides at VL `n`: down `n-k`, up `k` (down `k`, up `n-k` for the up-first form) | implemented (`inverse-slide-rotation`, both orders) |
-| Bit rotation in element | `vsrl s` ; `vsll SEW-s` ; `vor` | `vsll s` ; `vsrl SEW-s` ; `vor` | implemented (`inverse-bit-rotation`) |
-| Adjacent lane-pair swap | bit rotation by 32 at e64 | the same rotation again | implemented (`inverse-bit-rotation`) |
-| Zip (interleave, `tl.join`) | `vwaddu.vv` ; `vwmaccu.vx -1` | `a = vnsrl.wi 0` ; `b = vnsrl.wx SEW` | implemented (`deinterleave-of-zip`) |
-| Unzip (`tl.split`) | `vnsrl.wi 0` ; `vnsrl.wx SEW` | `v = zip(lo, hi)`, needs both halves | implemented (`zip-of-deinterleave`) |
-| Widen | `vsext` / `vzext`, `vwcvt(u)`, `vfwcvt` | `vnsrl.wi 0` / `vfncvt(.rtz)`, per x2 step | implemented (`narrow-of-widen`), vf2 / vf4 / vf8 |
-| Flip (`tl.flip`), permutation | `vid` ; `vrsub` ; `vrgather` ; `vslidedown` | same gather again, or inverse index | implemented (`flip-of-flip`, `inverse-permutation-gather`) |
-| Self-inverse permutation (block swaps, `tl.sum` butterfly step) | `vrgatherei16.vv` by a constant index `p`, `p == inverse(p)` | the same gather with the same index (`vrgatherei16.vv y, idx`) | implemented (self-inverse) |
-| Mask to vector, widen by k | `vmerge.vim 0, -1` ; `vwadd.vx`, `vfwmul.vf` | `vmsne.vi 0` ; `narrow(y - k)`, `narrow(y / k)` | possible |
+- `reshape`: `x = tl.load(...)`, `y = tl.reshape(x, (4, 16))`, then `y` is stored row-major (so `out == a`). It shows only what `tl.reshape` itself becomes.
+- `reshape_live`: built like `flip_live`, with `y = tl.reshape(x, (4, 16))` in place of the flip. The four products use 4 x 16 weight tiles, and `x` is used again in 1D: `(reshape(r + s) ^ x) - reshape(y)`.
 
-### Non-Elementwise Ops That Cannot
+### Lowering
 
-| Group | Lowered to | Why the source is lost | status |
-|---|---|---|---|
-| Slide alone | `vslideup` / `vslidedown`, `vslide1up` / `vslide1down` | k lanes fall off one end | no (the rotation pair is implemented) |
-| Narrow alone | `vnsrl`, `vnsra`, `vnclip`, `vfncvt` | drops the upper half, or rounds | no (the unzip pair is implemented) |
-| Gather with repeats, splat lane | `vrgather.vv` / `.vx` / `.vi` | several lanes read one source lane | no |
-| Compress, merge | `vcompress.vm`, `vmerge.vvm` | unselected lanes are dropped | no |
-| Reduction | `vredsum`, `vredmax`, `vfredosum`, ... | a vector becomes one scalar | no |
-| Element move | `vmv.x.s`, `vfmv.f.s`, `vmv.s.x` | only one lane is kept | no |
-| Mask ops | `vmseq`, `vmflt`, `vcpop`, `vfirst`, `viota`, `vmsbf` | many values map to one bit or count | no |
-| Widening multiply, both unknown | `vwmul.vv`, `vfwmul.vv` | a product does not fix both factors | no |
+| stage | `tl.reshape(x, (4, 16))` becomes |
+|---|---|
+| TTIR | `tt.reshape %x : tensor<64xi32> -> tensor<4x16xi32>` |
+| TTCIR / TTTCIR | `vector.shape_cast %x : vector<64xi32> to vector<4x16xi32>`; the 2D store becomes 4 `vector.extract %y[i]` + `vector.store` of 16 lanes |
+| LLIR | no 2D vector exists, so the cast disappears: each row is a slice `shufflevector <64 x i32> %x, poison, <16 x i32> <16i .. 16i+15>` |
+| assembly (`reshape`) | the 4 slices are stored back to back, so the backend folds them away: one `vle32.v` + one `vse32.v` at `e32, m8` |
 
-## Which RVV instructions can be reversed
+The reshape back, `vector.shape_cast vector<4x16xi32> to vector<64xi32>`, lowers in LLIR to a chain of concatenating `shufflevector`s (16 + 16 → 64 with poison, then merged into the 64-lane value). In `reshape_live` the rows are computed on, so each row lives in its own LMUL 2 group, and the concatenation becomes slides: 3 `vslideup` and 3 `vslidedown` in the assembly, no `vrgather`.
 
-The tables below classify RVV instructions in two groups. The elementwise tables hold instructions that compute lane `i` of `y` from lane `i` of the sources: arithmetic, logic, shifts, compares and conversions, including widening and narrowing, where lane `i` of the narrow vector maps to lane `i` of the wide one. The data-movement tables hold instructions that copy or select values without computing on them, or that read other lanes: copies, slides, gathers, compress, merge, scalar moves, splats, reductions and mask scans. Widening, interleave through widening arithmetic (`vwaddu` + `vwmaccu`), deinterleave through `vnsrl` and lane swaps through shift pairs change the layout, so they are listed in the data-movement tables, not in the elementwise ones.
+So a row-major reshape moves no lane in the tensor, but it is free only when it folds away at load/store. When the 2D value is computed on, it costs a split of the LMUL 8 group into rows and a slide-based concatenation back.
 
-`y` is the result, `v` the value to rebuild, `K` the other source. "Implemented" refers to `ReversePatterns` / `matchReverseOp`, `matchGroupPlans`, `matchFlipPlan` and `matchPermPlan` in `ExpandPseudos.cpp`. "Possible" means the inverse exists but is not matched yet.
+### Result on `reshape_live`
 
-### Elementwise instructions
+Compiled with Triton, LMUL 8, `-verify-machineinstrs`, run on the board:
 
-#### Elementwise that is reversible
+| config | max VP / SLIL | instrs | fires | spills / reloads | board |
+|---|---|---|---|---|---|
+| none | 42 / 2120 | 127 | - | 2 / 2 | PASS 0.030 ms |
+| `--custom-reverse` | 42 / 2120 → 40 / 2278 | 118 | 7 `elementwise` | 0 / 0 | PASS 0.026 ms |
 
-| RVV instruction (`y = ...`) | rebuild of `v` | live at the site | exact | status |
-|---|---|---|---|---|
-| `vadd.vv/vx` (`v + K`) | `vsub y, K` | y, K | exact | implemented (elementwise) |
-| `vadd.vi` (`v + imm`) | `vadd.vi y, -imm` (not for imm = -16) | y | exact | implemented |
-| `vsub.vv/vx` (`v - K` / `K - v`) | `vadd y, K` / `vsub K, y` | y, K | exact | implemented |
-| `vrsub.vx/vi` (incl. `vneg`) | `vrsub` again | y, K | exact | implemented |
-| `vxor.vv/vx/vi` (incl. `vnot`) | `vxor` again | y, K | exact | implemented |
-| `vfadd` / `vfsub` / `vfrsub` | inverse op | y, K | rounded | implemented |
-| `vfmul` / `vfdiv` / `vfrdiv` | inverse op | y, K | rounded | implemented |
-| `vmul.vx v, c`, c an odd constant | `vmul.vx y, c^-1 mod 2^SEW` | y | exact | possible (integer `MUL` is never reversed today) |
-| `vmacc` / `vmadd` (`y = a * b + v`) | `vnmsac`: `v = y - a * b` | y, a, b | exact | possible (tied passthru is rejected today) |
-| `vfmacc` / `vfmadd` (accumulator `v`) | `vfnmsac` | y, a, b | rounded | possible |
-| `vwadd(u).wv/wx` (`y = v + ext(b)`, `v` wide) | `vwsub(u).wv/wx` | y, b | exact | possible |
-| `vfsgnjn.vv v, v` (`vfneg`) | itself | y | exact | possible |
-| `vfmul` / `vfdiv` by a power of 2 | inverse op | y | exact without overflow / underflow | implemented as rounded |
+No data-movement plan fires, and `x` is not rebuilt from `y`. The split is slices of one value, and the concatenation is slides into a fresh value, not the `vslidedown k` + `vslideup n-k` rotation of one register that `inverse-slide-rotation` matches. The gain comes from 7 `elementwise` rebuilds (a `vsub` from a later `vadd`, 8 `vsub.vv` instead of 1), which remove both spills and save 9 instructions; SLIL rises. The times are single runs and within noise.
 
-#### Elementwise that cannot be reversed alone
+`reshape` alone passes on the board at 0.025 ms.
 
-These instructions drop part of `v`. They become reversible only where the dropped part is still held by another value: a partner instruction's result, or a side value that is live at the site.
+## Reversibility tables
 
-| RVV instruction | what is lost | reversible when | status |
-|---|---|---|---|
-| `vsrl` / `vsra` by s alone | low s bits | the low bits are known zero (e.g. after `vsll`, `vand` by a constant, `vmul` by an even constant): `vsll` | implemented (`sll-of-srl`, `knownZeroBits`) |
-| `vnsra`, `vnclip(u)`, `vfncvt.*`, `vfcvt.x.f`, `vfcvt.rtz.*` | high bits, rounding, saturation | - | no |
-| `vand`, `vor`, `vandn`, `vmin(u)`, `vmax(u)`, `vfmin`, `vfmax` | masked bits / losing operand | the complement is live (`v = (v & m) \| (v & ~m)`) | possible, rare |
-| mask `vmand`, `vmor`, `vmandn`, `vmorn`, `vmnor` with K | mask bits | the complement is live | no |
-| `vmul.vv`, `vmul.vx` by even or unknown K, `vmulh*`, `vdiv`, `vrem`, `vwmul` | high bits, remainder, division by zero | K an odd constant (above) | no |
-| `vsadd`, `vssub`, `vaadd`, `vasub`, `vsmul`, `vssrl`, `vssra` | saturation / rounding bit | - | no |
-| `vfsqrt`, `vfrec7`, `vfrsqrt7`, `vfabs`, `vfsgnj(x)` with K | sign / precision | - | no |
-| compares (`vmseq`, `vmflt`, ...) | all but one bit | - | no |
-
-### Data-movement instructions
-
-#### Data movement that can be reversed
-
-| instruction or group (`y = ...`) | rebuild of `v` | live at the site | exact | status |
-|---|---|---|---|---|
-| `vsext.vf2` / `vzext.vf2` | `vnsrl.wi y, 0` | y | exact | implemented (`narrow-of-widen`) |
-| `vwcvt(u).x.x.v` (`vwadd(u).vx v, x0`) | `vnsrl.wi y, 0` | y | exact | implemented |
-| `vfwcvt.f.f.v` | `vfncvt.f.f.w` | y | exact | implemented |
-| `vfwcvt.f.x(u).v` | `vfncvt.rtz.x(u).f.w` | y | exact | implemented |
-| `vrgather(ei16).vv v, idx`, constant permutation | gather by the inverse table | y | exact | implemented (`inverse-permutation-gather`) |
-| same, self-inverse permutation (block swaps) | `vrgatherei16 y, idx` | y, idx | exact | implemented (self-inverse) |
-| copies (`vmv.v.v`, `vmv<N>r`, `COPY`) | same value | y | exact | equivalence class |
-| `vslideup.vx/vi P, v, k` (tied passthru), `v`'s VL at most VLMAX - k | `vslidedown y, k` at `v`'s VL | y | exact | possible |
-| `vsext` / `vzext.vf4/vf8` | 2 or 3 `vnsrl.wi 0` | y | exact | implemented (`narrow-of-widen`) |
-| `vwaddu.vv a, b` + `vwmaccu.vx -1, b` | `vnsrl.wi y, 0` / `vnsrl.wi y, SEW` | y | exact | implemented (`deinterleave-of-zip`) |
-| `vnsrl.wi w, 0` + `vnsrl.wi w, SEW` | `vwaddu` + `vwmaccu` | both halves | exact | implemented (`zip-of-deinterleave`) |
-| `y = vcompress v, m` + `z = vcompress v, ~m` | `vrgather z, viota(~m)`, then `vrgather y, viota(m)` masked by `m` into it | y, z, m | exact | possible (about 5 instructions) |
-| `vmnot.m` (`vmnand.mm m, m`) | itself | y | exact | possible (masks are one register) |
-
-#### Data movement that cannot be reversed alone
-
-| instruction | what is lost | reversible only if | status |
-|---|---|---|---|
-| `vslidedown.vx/vi k` alone | lanes 0..k-1 | the partner `vslideup` exists (rotation), or lanes 0..k-1 of `v` are not demanded (`vslideup y, k`) | rotation implemented; demanded lanes not tracked |
-| `vslideup.vx/vi k` alone, `v` fills the register | top k lanes | the partner `vslidedown` exists (rotation) | implemented as a pair only |
-| `vslide1up.vx` / `vfslide1up.vf v, x` | `v[n-1]` | `v[n-1]` is in a live scalar: `vslide1down y, s` | possible, rare |
-| `vslide1down.vx` / `vfslide1down.vf v, x` | `v[0]` (`x` lands in lane `n-1`) | `v[0]` is in a live scalar: `vslide1up y, s` | possible, rare |
-| insert element: `vmv.s.x t, x` + `vslideup v, t, idx` at VL `idx+1`, tail undisturbed | `v[idx]` | old `v[idx]` is in a live scalar: the same pair with it | possible, rare |
-| `vmv.s.x` / `vfmv.s.f` into `v` | `v[0]` | `v[0]` is in a live scalar: `vmv.s.x y, s` | possible, rare |
-| `vmv.x.s` / `vfmv.f.s` (and extract element = `vslidedown` + `vmv.x.s`) | every other lane (scalar result) | `n == 1` | no |
-| `vrgather.vv` / `vrgatherei16.vv` by a constant non-permutation (repeated or missing lanes; an index of VLMAX or more gives 0) | lanes not selected | - | no |
-| `vrgather.vv` / `vrgatherei16.vv` by a computed index | unknown permutation | - | no |
-| `vrgather.vx` / `vrgather.vi` | all lanes but one (splat) | - | no |
-| `vcompress.vm` alone | lanes where `m` is 0 | the complementary compress is live (previous table) | possible |
-| `vmerge.vvm` / `vxm` / `vim`, `vfmerge.vfm` (`vselect`) | lanes of `v` replaced by the other source | the replaced lanes are live in another value (a second `vmerge`) | no, rare |
-| `vsll` by s alone | high s bits | the high bits are known zero (e.g. after `vzext`, `vsrl`, `vand` by a constant): `vsrl` | implemented (`srl-of-sll`) |
-| `vnsrl.wi 0` alone | high bits | the high bits are known zero (e.g. after `vzext.vf2`, `vsrl`, `vand` by `2^SEW - 1`): `vzext.vf2` | implemented (`zext-of-narrow`) |
-| `vwaddu.vv a, b` alone | `b` is mixed in | followed by `vwmaccu.vx -1, b` (zip) | implemented (`deinterleave-of-zip`) |
-| `vnsrl.wi 0` / `vnsrl.wi SEW` alone | the other half | the partner is live (first table) | implemented as a pair only |
-| `vmv.v.v` with a smaller VL and tail undisturbed (`PseudoVMV_V_V` with a passthru) | lanes from VL on | the tail of `v` is not demanded | no |
-| `EXTRACT_SUBREG` of one part of `v` (also tuple extract after `vlseg`) | the other parts | all parts are live: `REG_SEQUENCE` | possible |
-| any reversible instruction (either table), masked (`v0.t`) or tail undisturbed | inactive / tail lanes take the passthru | those lanes of `v` are not demanded | no |
-| `vsll` / `vsrl` / `vsra` / `vnsra` by `s` alone | high / low bits | the partner shift exists (rotation), or the lost bits are known | rotation implemented; `vsll` with known-zero high bits and `vsrl` / `vsra` with known-zero low bits implemented |
-| `vredsum`, `vredmax(u)`, `vredmin(u)`, `vredand/or/xor`, `vfred*`, `vwred*` | lanes collapsed into one | - | no |
-| `viota.m`, `vmsbf.m`, `vmsif.m`, `vmsof.m`, `vcpop.m`, `vfirst.m` | mask turned into a count or a prefix | - | no |
-| `vmv.v.x` / `vmv.v.i`, `vfmv.v.f`, `vid.v`, `vmset.m` / `vmclr.m`, `PseudoClearVR` | no vector source | - | not a reverse case (direct remat) |
-
-`n` is the VL, `p` a constant permutation, `q` its inverse.
-
-### Partially reversing a Triton op
-
-A Triton op that lowers to several RVV instructions can be reversed one instruction at a time from its last one, since each rebuilt value joins `v`'s equivalence class and the next step can read it (`DocReverse.md`, "Chained pattern"). Only the instructions on the data path from `v` to `y` must be reversible. Instructions off that path (index builders such as `vid` / `vrsub`, constant loads, masks) are never inverted; their results only have to be live at the site, as the flip rebuild does with `idx`.
-
-For an op `v -> i1 -> t1 -> ... -> i4 -> t4 -> i5 -> y`, peeling `i5` and `i4` gives `t3` back. If `i3` is in a "not reversible alone" table:
-
-- If the part `i3` drops is held by a value live at the site (the partner slide, the other `vnsrl` half, the complement of an `vand`), `t2` can be rebuilt and peeling continues down to `v`.
-- If not, `v` cannot be rebuilt by reversal. `t3` and `t4` still can, which helps when one of them has a distant use; `v` itself is left to a direct option from a root that is still live.
+The tables of which Triton ops and which RVV instructions can be reversed are in `DocVectorTable.md`.
 
 ## Limitations
 
 - Profitability is the gap rule only. A rebuild of 5 instructions (reload) or 11 (flip without a live index) is applied as readily as a single instruction. Weighing the rebuild's length against the freed live range, or requiring a longer gap for longer rebuilds, would avoid the 07 slowdown.
 - The self-inverse rebuild only applies where the original index is live. Extending a small index group (LMUL 2-4) to free an LMUL-8 value is not considered.
-- Each reload rebuild adds its own constant-pool entry, even when several remats need the same inverse table.
+- A loaded inverse table is shared only between gathers with the same opcode, and only an index lighter than `v` may be kept live past its last use. The self-inverse plan never extends its index, so a site where the original index has died still reloads (07's 29 reload sites).
+- `constantPoolIndexOf` recognizes the table address only as `AUIPC` + `ADDI` (PIC, which Triton uses) or `LUI` + `ADDI`. In llc's default non-PIC mode the address is a `PseudoMovAddr`, and no permutation rebuild fires.
 - The flip rebuild depends on the shuffle form of `tl.flip` (`TRITON_CPU_FLIP_TO_SHUFFLE=1`). The default xor-chain lowering gives `matchFlipPlan` nothing to match.

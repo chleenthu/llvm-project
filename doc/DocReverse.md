@@ -84,6 +84,77 @@ ReverseRemat[elementwise, rounded]: recompute %28 from %62, %44 ...
 
 Here the gap is between uses 44 and 60. Only the option at 44 lies before it. `%28` is recomputed as `%62 − %44` right after `%62`/`%44` die, which leaves a hole of more than `RematGap` instructions.
 
+### Example: inputs `A0`, `A1` and the site `P`
+
+Each option reads one or two values, its `RevPlan::Ins` (`y` for `v = y - 7`, `y` and `k` for `v = y - k`). Any register that holds the same value may be read instead: the input itself, if it is not redefined before the site, or a copy left by an earlier step. `AltsOf` lists these alternatives as `Alt`s:
+
+| field | meaning |
+|---|---|
+| `Reg` | the register |
+| `Def` | its last def in the block (−1 for the input itself, or a value live into the block); the site must come after it |
+| `Last` | the last position it is read anyway; set to infinity for a scalar, which does not count against vector pressure |
+| `W` | its pressure weight if it is a vector, 0 for a scalar |
+
+`TryOption` tries every pair `(A0, A1)`, one alternative of `Ins[0]` and one of `Ins[1]`, and computes the site for each:
+
+```text
+P = min(PGap, A.Last + 1 for each vector alternative A)
+```
+
+`PGap` is the latest site the stall gap to `U2` allows. A pair is rejected if `P < U1 + RematGap`, `P <= A.Def`, or a reused scalar changes before `P`. The pair with the latest `P` wins and is stored in `Best.In`; emission reads it as `In0`, `In1`.
+
+So `P` always falls within `U1 + RematGap ≤ P ≤ PGap ≤ U2`.
+
+A block with `v` at LMUL 8 (weight 8), `RematGap` 6:
+
+```text
+ 0: v  = vle ...
+ 1: k  = vle ...
+ 2: y  = vadd.vv v, k       ; Q: v's use before the gap (U1 = 2); option "v = y - k"
+ 3: ...
+ 5: ... = vmul y, ...       ; y read
+ 8: ... = vmul k, ...       ; last read of the original k
+11: k2 = <rebuild of k>     ; an earlier step left a copy of k
+13: ... = vfoo k2           ; last read of k2
+14: ... = vmul y, ...       ; last read of y
+15: ... = vxor ..., v       ; v needed again (U2 = 15)
+```
+
+The plan is `v = vsub y, k`, with `Ins[0] = y` (valid from 3) and `Ins[1] = k` (valid from 2). The alternatives:
+
+| | `Reg` | `Def` | `Last` | `W` |
+|---|---|---|---|---|
+| `Alts[0]`, for `y` | `y` | −1 | 14 | 8 |
+| `Alts[1]`, for `k` | `k` | −1 | 8 | 8 |
+| `Alts[1]`, for `k` | `k2` | 11 | 13 | 8 |
+
+With `PGap = 15` (at LMUL 8 the rebuild may sit right before `U2`):
+
+| `A0` | `A1` | `P` | checks | |
+|---|---|---|---|---|
+| `y` | `k` | min(15, 15, 9) = **9** | 9 ≥ U1 + 6 = 8, 9 > −1 | qualifies |
+| `y` | `k2` | min(15, 15, 14) = **14** | 14 ≥ 8, 14 > 11 | qualifies, later |
+
+`Last + 1` places the rebuild right after an input's last existing read: reading `k` at 9 keeps `k` alive one position longer instead of until 15. The latest site wins, since it leaves the longest hole in `v`:
+
+```cpp
+Best = {V = v, Plan, {A0 = y, A1 = k2}, At = 2, P = 14, U1 = 2, U2 = 15,
+        16, Benefit = (14 - 2 - 1) * 8 = 88};
+```
+
+The rebuild is inserted before position 14, with `In0 = y` and `In1 = k2`:
+
+```text
+13: ... = vfoo k2
+    v' = vsub.vv y, k2      ; P = 14
+14: ... = vmul y, ...
+15: ... = vxor ..., v'
+```
+
+`v` now dies at 2 instead of 15. `y` is read inside its existing live range, and `k2` one position past it.
+
+A plan with one input leaves `A1` as the placeholder `None` = `{Register(), -1, infinity, 0}`, which never limits `P` or rejects a site. If position 2 were `y = vzext.vf2 v` (`narrow-of-widen`, `Ins = {y}`), then `P = min(15, 14 + 1) = 15`, `Best.In = {y, None}`, and the rebuild is `v' = vnsrl.wi y, 0` before position 15, with `In1` null and unused. The same holds for the shift and narrow rebuilds, the slide and bit rotations, the flip, and an elementwise op with an immediate (`vadd.vi`). The second input exists only for an elementwise op with a register operand (`.vx`: a scalar `Alt`; `.vv`: a vector one), for `zip-of-deinterleave` (`hi`), and for the self-inverse gather (`idx`).
+
 ### Reversible operations
 
 `q` must be an unmasked `PseudoV<OP>_<VV|VX|VI|VFPR*>_<LMUL>[_E<SEW>]` with an undef passthru:
