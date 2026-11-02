@@ -1578,6 +1578,33 @@ static bool readsOnlyPrefix(const TargetInstrInfo *TII,
                             const MachineRegisterInfo &MRI,
                             const MachineInstr &U, Register R,
                             const ElemRange &ER) {
+  // A mask (ER.Bits == 1) is read through a copy to v0 by the next
+  // instruction reading v0, one bit per element up to that one's VL.
+  if (ER.Bits == 1) {
+    if (!U.isCopy() || U.getOperand(0).getReg() != RISCV::V0 ||
+        U.getOperand(1).getReg() != R || U.getOperand(1).getSubReg())
+      return false;
+    const TargetRegisterInfo *TRI = MRI.getTargetRegisterInfo();
+    for (MachineBasicBlock::const_iterator It = std::next(U.getIterator()),
+                                           E = U.getParent()->end();
+         It != E; ++It) {
+      if (It->isDebugInstr())
+        continue;
+      if (It->readsRegister(RISCV::V0, TRI)) {
+        const MCInstrDesc &CD = It->getDesc();
+        if (!RISCVII::hasVLOp(CD.TSFlags))
+          return false;
+        const MachineOperand &CVL = It->getOperand(RISCVII::getVLOpNum(CD));
+        std::optional<int64_t> CC = constVL(CVL, MRI), CR = constVL(ER.VL, MRI);
+        if (CC && CR)
+          return *CC <= *CR;
+        return CVL.isReg() && ER.VL.isReg() && CVL.getReg() == ER.VL.getReg();
+      }
+      if (It->modifiesRegister(RISCV::V0, TRI))
+        return true; // the copy is never read
+    }
+    return true;
+  }
   StringRef Name = TII->getName(U.getOpcode());
   if (!Name.consume_front("PseudoV"))
     return false;
@@ -1606,8 +1633,13 @@ static bool readsOnlyPrefix(const TargetInstrInfo *TII,
     const MachineOperand &MO = U.getOperand(I);
     if (!MO.isReg() || MO.getReg() != R)
       continue;
-    if (MO.isDef() || MO.getSubReg() || MO.isImplicit() ||
-        (MO.isTied() && !TailAgnostic))
+    // The low sub-register of a group holds its first elements, so reading
+    // it reads a prefix like reading the whole group does.
+    if (MO.isDef() || MO.isImplicit() || (MO.isTied() && !TailAgnostic) ||
+        (MO.getSubReg() &&
+         !StringRef(MRI.getTargetRegisterInfo()->getSubRegIndexName(
+                        MO.getSubReg()))
+              .ends_with("_0")))
       return false;
     Bits = std::max(Bits, elementBitsRead(Name, I, 1u << Log2SEW));
   }
@@ -1813,6 +1845,11 @@ struct RevPlan {
     UnshiftR,    // v = Y << s from Y = v >> s (logical or arithmetic), v's
                  // low s bits known zero
     ZextNarrow,  // v = zext(Y) from Y = vnsrl(v, 0), v's top half known zero
+    MaskMerge,   // m = vmsne(Y, 0) from Y = vmerge(0, c, m), c != 0
+    ConcatLow,   // a = Y's low part from Y = vslideup(a, b, off): a's lanes
+                 // below off are untouched
+    ConcatHigh,  // b = vslidedown(Y, off) from Y = vslideup(a, b, off)
+    PrefixSum,   // v = Y - vslide1up(Y, 0) from Y[i] = v[0] + ... + v[i]
   };
   KindTy Kind = Elementwise;
   // The instructions computing the group's result from v (Fwd[0] is the use
@@ -1849,6 +1886,10 @@ struct RevPlan {
   bool PermReuseIdx = false;
   // PermGather reusing another index that holds the inverse permutation.
   bool PermShared = false;
+  // ConcatLow: the sub-register of v that holds its data (0 for all of v).
+  unsigned SubIdx = 0;
+  // ConcatHigh: the number of elements of v that hold data.
+  int64_t DataVL = 0;
   unsigned dstOpcode() const { return Opcs.empty() ? Op.Opcode : Opcs.back(); }
   // Instructions the rebuild adds, roughly: a direct chain replays its
   // links, the others emit their opcodes and replay their clones.
@@ -1874,6 +1915,10 @@ static const char *planName(RevPlan::KindTy K) {
   case RevPlan::Unshift: return "srl-of-sll";
   case RevPlan::UnshiftR: return "sll-of-srl";
   case RevPlan::ZextNarrow: return "zext-of-narrow";
+  case RevPlan::MaskMerge: return "mask-of-merge";
+  case RevPlan::ConcatLow: return "low-of-concat";
+  case RevPlan::ConcatHigh: return "slidedown-of-concat";
+  case RevPlan::PrefixSum: return "diff-of-prefix-sum";
   }
   return "?";
 }
@@ -2549,10 +2594,22 @@ static void matchGroupPlans(const TargetInstrInfo *TII,
         Rev = Steps.back();
         VLog2SEW = Log2SEW - Steps.size();
       }
-    } else if ((N.starts_with("WADD_VX_") || N.starts_with("WADDU_VX_")) &&
-               Q.getOperand(3).isReg() &&
-               Q.getOperand(3).getReg() == RISCV::X0) {
-      Rev = Opcode("PseudoVNSRL_WI_" + L); // vwcvt(u).x.x.v
+    } else if ((N.starts_with("WADD_VX_") || N.starts_with("WADDU_VX_") ||
+                N.starts_with("WSUB_VX_") || N.starts_with("WSUBU_VX_")) &&
+               Q.getOperand(3).isReg()) {
+      // Widen by k: y = ext(v) +- ext(k). The low SEW bits of y are v +- k
+      // whatever k's upper bits, so v = narrow(y) -+ k at v's own SEW and
+      // LMUL. By x0 (vwcvt(u).x.x.v) the narrow alone.
+      unsigned Nsrl = Opcode("PseudoVNSRL_WI_" + L);
+      if (Q.getOperand(3).getReg() == RISCV::X0) {
+        Rev = Nsrl;
+      } else if (unsigned Fix = Opcode(
+                     Twine("PseudoV") + (N.starts_with("WADD") ? "SUB" : "ADD") +
+                     "_VX_" + L);
+                 Nsrl && Fix) {
+        Steps = {Nsrl, Fix};
+        Rev = Fix;
+      }
     } else if (N.starts_with("FWCVT_F_F_V_")) {
       Rev = Opcode("PseudoVFNCVT_F_F_W_" + L);
     } else if (N.starts_with("FWCVT_F_X_V_") || N.starts_with("FWCVT_F_XU_V_")) {
@@ -2832,6 +2889,392 @@ static void matchGroupPlans(const TargetInstrInfo *TII,
   }
 }
 
+// The instruction that writes the data of R and the sub-register it writes
+// (0 for all of R): R's one def that is an RVV pseudo with a constant VL,
+// the others only making the rest of a register group defined (INIT_UNDEF,
+// IMPLICIT_DEF). Only a low sub-register (sub_vrm<n>_0) counts, whose
+// elements are R's first ones.
+static MachineInstr *dataDef(const TargetInstrInfo *TII,
+                             const TargetRegisterInfo *TRI,
+                             const MachineRegisterInfo &MRI,
+                             const ReverseBlockModel &BM, Register R,
+                             unsigned &SubIdx) {
+  auto It = BM.Regs.find(R);
+  if (It == BM.Regs.end())
+    return nullptr;
+  MachineInstr *Data = nullptr;
+  for (unsigned D : It->second.Defs) {
+    MachineInstr *MI = BM.Instrs[D];
+    if (MI->getOpcode() == TargetOpcode::INIT_UNDEF ||
+        MI->getOpcode() == TargetOpcode::IMPLICIT_DEF)
+      continue;
+    const MCInstrDesc &Desc = MI->getDesc();
+    if (Data || !TII->getName(MI->getOpcode()).starts_with("PseudoV") ||
+        !RISCVII::hasVLOp(Desc.TSFlags) || !RISCVII::hasSEWOp(Desc.TSFlags) ||
+        MI->getNumExplicitDefs() != 1 || MI->getOperand(0).getReg() != R ||
+        !constVL(vlOperand(*MI), MRI))
+      return nullptr;
+    unsigned Sub = MI->getOperand(0).getSubReg();
+    if (Sub && !StringRef(TRI->getSubRegIndexName(Sub)).ends_with("_0"))
+      return nullptr;
+    Data = MI;
+    SubIdx = Sub;
+  }
+  return Data;
+}
+
+// Mask to vector: Y = vmerge.vim(0, c, m) with c != 0 holds c where m is set
+// and 0 elsewhere, so m = vmsne.vi(Y, 0). Q is the copy of v = m to v0 that
+// the merge reads.
+static void matchMaskPlan(const TargetInstrInfo *TII,
+                          const MachineRegisterInfo &MRI,
+                          const ReverseBlockModel &BM, MachineInstr &Q,
+                          Register VIn, SmallVectorImpl<RevPlan> &Out) {
+  if (!Q.isCopy() || Q.getOperand(0).getReg() != RISCV::V0 ||
+      Q.getOperand(1).getReg() != VIn || Q.getOperand(1).getSubReg() ||
+      !RISCV::VRRegClass.hasSubClassEq(MRI.getRegClass(VIn)))
+    return;
+  const TargetRegisterInfo *TRI = MRI.getTargetRegisterInfo();
+  unsigned QPos = BM.Pos.lookup(&Q);
+  MachineInstr *M = nullptr;
+  for (unsigned I = QPos + 1, E = BM.Instrs.size(); I != E && !M; ++I) {
+    MachineInstr *MI = BM.Instrs[I];
+    if (MI->readsRegister(RISCV::V0, TRI))
+      M = MI;
+    else if (MI->modifiesRegister(RISCV::V0, TRI))
+      return;
+  }
+  if (!M)
+    return;
+  StringRef MName = TII->getName(M->getOpcode());
+  if (!MName.starts_with("PseudoVMERGE_VIM_") || !hasUndefPassthru(*M) ||
+      !M->getOperand(0).getReg().isVirtual() || M->getOperand(0).getSubReg() ||
+      !M->getOperand(2).isReg() || !M->getOperand(3).isImm() ||
+      M->getOperand(3).getImm() == 0 || M->getOperand(4).getReg() != RISCV::V0)
+    return;
+  // The false value: a splat of 0 over at least the merge's elements.
+  const MachineOperand &ZOp = M->getOperand(2);
+  const MachineInstr *Z =
+      ZOp.getReg().isVirtual() && !ZOp.getSubReg()
+          ? MRI.getUniqueVRegDef(ZOp.getReg())
+          : nullptr;
+  if (!Z || !TII->getName(Z->getOpcode()).starts_with("PseudoVMV_V_I_") ||
+      !hasUndefPassthru(*Z) || !Z->getOperand(2).isImm() ||
+      Z->getOperand(2).getImm() != 0 || log2SEWOf(*Z) != log2SEWOf(*M))
+    return;
+  std::optional<int64_t> ZVL = constVL(vlOperand(*Z), MRI),
+                         MVL = constVL(vlOperand(*M), MRI);
+  if (!(ZVL && MVL && *ZVL >= *MVL) && !sameVLAndSEW(*Z, *M))
+    return;
+  unsigned Msne = findPseudo(TII, "PseudoVMSNE_VI_" + lmulSuffix(MName).str())
+                      .value_or(0);
+  if (!Msne)
+    return;
+  RevPlan P;
+  P.Kind = RevPlan::MaskMerge;
+  P.Fwd = {M};
+  P.Ins.push_back({M->getOperand(0).getReg(), BM.Pos.lookup(M) + 1, {{Msne, 1}}});
+  P.Opcs = {Msne};
+  P.Valid = makeRange(vlOperand(*M), log2SEWOf(*M), TII->get(Msne), 1);
+  Out.push_back(P);
+}
+
+// Concatenate: Y = vslideup.v[xi](a, b, off) leaves a's elements below off
+// in place and puts b's from off on.
+//   a: Q is the copy of a that the slide takes as its passthru. a's data
+//      (its first n_a <= off elements) is Y's low part: a = COPY of Y's
+//      sub-register that a's data was written to, or of all of Y.
+//   b: Q is the slide, b its source. b's data (its first n_b elements, with
+//      off + n_b within the slide's VL) is vslidedown(Y, off) at VL n_b.
+static void matchConcatPlans(const TargetInstrInfo *TII,
+                             const TargetRegisterInfo *TRI,
+                             const MachineRegisterInfo &MRI,
+                             const ReverseBlockModel &BM, MachineInstr &Q,
+                             Register VIn, SmallVectorImpl<RevPlan> &Out) {
+  unsigned SubIdx = 0;
+  MachineInstr *D = dataDef(TII, TRI, MRI, BM, VIn, SubIdx);
+  if (!D)
+    return;
+  int64_t NData = *constVL(vlOperand(*D), MRI);
+  unsigned QPos = BM.Pos.lookup(&Q);
+  auto IsSlideUp = [&](const MachineInstr &W, StringRef &L) {
+    StringRef Name = TII->getName(W.getOpcode());
+    if (!(Name.starts_with("PseudoVSLIDEUP_VX_") ||
+          Name.starts_with("PseudoVSLIDEUP_VI_")) ||
+        Name.contains("MASK") || W.getOperand(0).getSubReg() ||
+        W.getOperand(2).getSubReg() || log2SEWOf(W) != log2SEWOf(*D))
+      return false;
+    L = lmulSuffix(Name);
+    return true;
+  };
+
+  // a, the slide's passthru through a copy.
+  if (Q.isCopy() && Q.getOperand(1).getReg() == VIn &&
+      !Q.getOperand(1).getSubReg() && !Q.getOperand(0).getSubReg() &&
+      Q.getOperand(0).getReg().isVirtual()) {
+    Register T = Q.getOperand(0).getReg();
+    auto TIt = BM.Regs.find(T);
+    MachineInstr *W = nullptr;
+    if (TIt != BM.Regs.end())
+      for (unsigned D2 : TIt->second.Defs)
+        if (D2 > QPos) {
+          W = BM.Instrs[D2];
+          break;
+        }
+    StringRef L;
+    std::optional<int64_t> Off =
+        W ? constOperand(W->getOperand(3), MRI) : std::nullopt;
+    if (W && IsSlideUp(*W, L) && W->getOperand(1).getReg() == T &&
+        !W->getOperand(1).isUndef() && Off && *Off >= NData &&
+        MRI.getRegClass(T) == MRI.getRegClass(VIn)) {
+      RevPlan P;
+      P.Kind = RevPlan::ConcatLow;
+      P.Fwd = {W};
+      P.Ins.push_back({T, BM.Pos.lookup(W) + 1, {}});
+      P.Opcs = {TargetOpcode::COPY};
+      P.SubIdx = SubIdx;
+      P.Valid = makeRange(vlOperand(*D), log2SEWOf(*D), D->getDesc(),
+                          1u << log2SEWOf(*D));
+      Out.push_back(P);
+    }
+  }
+
+  // b, the slide's source.
+  StringRef L;
+  if (!IsSlideUp(Q, L))
+    return;
+  std::optional<int64_t> Off = constOperand(Q.getOperand(3), MRI);
+  std::optional<int64_t> NL = constVL(vlOperand(Q), MRI);
+  if (Q.getOperand(2).getReg() == VIn && Q.getOperand(0).getReg().isVirtual() &&
+      Off && *Off > 0 && NL && *Off + NData <= *NL) {
+    unsigned Down = findPseudo(TII, Twine("PseudoVSLIDEDOWN_") +
+                                        amountForm(Q.getOperand(3)) + L)
+                        .value_or(0);
+    if (Down) {
+      RevPlan P;
+      P.Kind = RevPlan::ConcatHigh;
+      P.Fwd = {&Q};
+      P.Ins.push_back({Q.getOperand(0).getReg(), QPos + 1, {{Down, 2}}});
+      P.Opcs = {Down};
+      P.DataVL = NData;
+      P.Valid = makeRange(vlOperand(*D), log2SEWOf(Q), TII->get(Down),
+                          1u << log2SEWOf(Q));
+      Out.push_back(P);
+    }
+  }
+}
+
+// Prefix sum: Y[i] = v[0] + ... + v[i] for the N elements in use, however
+// the scan was lowered (LLVM's shuffle lowering of tl.cumsum: slides, some
+// masked by constant masks, tail-undisturbed merges and adds). From the
+// first use Q of v, every value computed from v is followed lane by lane as
+// a linear combination of v's lanes; a value whose lanes are exactly the
+// prefix sums is Y, and v = Y - vslide1up(Y, 0).
+static void matchPrefixSumPlan(const TargetInstrInfo *TII,
+                               const MachineRegisterInfo &MRI,
+                               const ReverseBlockModel &BM, MachineInstr &Q,
+                               Register VIn, SmallVectorImpl<RevPlan> &Out) {
+  auto RIt = BM.Regs.find(VIn);
+  if (RIt == BM.Regs.end())
+    return;
+  const ReverseBlockModel::RegRefs &VR = RIt->second;
+  unsigned QPos = BM.Pos.lookup(&Q);
+  unsigned Start = VR.Defs.empty() ? 0 : VR.Defs.back() + 1;
+  auto First = llvm::find_if(VR.Reads, [&](unsigned R) { return R >= Start; });
+  StringRef QName = TII->getName(Q.getOpcode());
+  if (First == VR.Reads.end() || *First != QPos ||
+      !QName.starts_with("PseudoV") || !RISCVII::hasVLOp(Q.getDesc().TSFlags) ||
+      !RISCVII::hasSEWOp(Q.getDesc().TSFlags))
+    return;
+  std::optional<int64_t> NC = constVL(vlOperand(Q), MRI);
+  if (!NC || *NC < 2 || *NC > 128)
+    return;
+  unsigned N = *NC, Log2SEW = log2SEWOf(Q);
+  const TargetRegisterInfo *TRI = MRI.getTargetRegisterInfo();
+
+  // Lane i of a value: Coef[i * N + j] times v[j], when Known[i].
+  struct Form {
+    SmallVector<int, 0> Coef;
+    BitVector Known;
+  };
+  DenseMap<Register, Form> Vals;
+  // Masks: Bits[i] for lane i, when Known[i].
+  struct MaskBits {
+    BitVector Bits, Known;
+  };
+  DenseMap<Register, MaskBits> Masks;
+  std::optional<MaskBits> V0;
+  Form Id{SmallVector<int, 0>(N * N, 0), BitVector(N, true)};
+  for (unsigned I = 0; I != N; ++I)
+    Id.Coef[I * N + I] = 1;
+  Vals[VIn] = Id;
+  Form Unknown{SmallVector<int, 0>(N * N, 0), BitVector(N, false)};
+
+  auto IsPrefix = [&](const Form &F) {
+    if (!F.Known.all())
+      return false;
+    for (unsigned I = 0; I != N; ++I)
+      for (unsigned J = 0; J != N; ++J)
+        if (F.Coef[I * N + J] != (J <= I ? 1 : 0))
+          return false;
+    return true;
+  };
+  // A vector operand's lanes: tracked, or unknown (an undef passthru too).
+  auto Lanes = [&](const MachineOperand &MO) -> const Form * {
+    if (!MO.isReg() || MO.getSubReg() || !MO.getReg().isVirtual())
+      return nullptr;
+    auto It = Vals.find(MO.getReg());
+    return It == Vals.end() ? nullptr : &It->second;
+  };
+  auto CopyLane = [&](Form &Dst, unsigned I, const Form *Src, unsigned SrcI) {
+    if (!Src || SrcI >= N || !Src->Known[SrcI])
+      return;
+    Dst.Known.set(I);
+    std::copy_n(Src->Coef.begin() + SrcI * N, N, Dst.Coef.begin() + I * N);
+  };
+
+  SmallVector<std::pair<Register, unsigned>, 2> Found;
+  for (unsigned P = QPos, E = std::min<size_t>(BM.Instrs.size(), QPos + 512);
+       P != E; ++P) {
+    MachineInstr &MI = *BM.Instrs[P];
+    StringRef Name = TII->getName(MI.getOpcode());
+    std::optional<Form> Res;
+    std::optional<MaskBits> ResMask;
+    Register Dst;
+    if (MI.isCopy()) {
+      Register S = MI.getOperand(1).getReg();
+      Dst = MI.getOperand(0).getReg();
+      if (!MI.getOperand(1).getSubReg() && !MI.getOperand(0).getSubReg()) {
+        if (auto It = Vals.find(S); It != Vals.end())
+          Res = It->second;
+        if (auto It = Masks.find(S); It != Masks.end())
+          ResMask = It->second;
+      }
+      if (Dst == RISCV::V0) {
+        V0 = ResMask;
+        continue;
+      }
+    } else if (Name.starts_with("PseudoV") && RISCVII::hasVLOp(MI.getDesc().TSFlags) &&
+               RISCVII::hasSEWOp(MI.getDesc().TSFlags) &&
+               MI.getNumExplicitDefs() == 1 && MI.getOperand(0).isReg() &&
+               !MI.getOperand(0).getSubReg()) {
+      Dst = MI.getOperand(0).getReg();
+      std::optional<int64_t> K = constVL(vlOperand(MI), MRI);
+      unsigned S = log2SEWOf(MI);
+      bool TA = true, MA = true;
+      if (RISCVII::hasVecPolicyOp(MI.getDesc().TSFlags)) {
+        int64_t Pol = MI.getOperand(RISCVII::getVecPolicyOpNum(MI.getDesc())).getImm();
+        TA = Pol & RISCVVType::TAIL_AGNOSTIC;
+        MA = Pol & RISCVVType::MASK_AGNOSTIC;
+      }
+      const Form *Pass = hasUndefPassthru(MI) ? nullptr : Lanes(MI.getOperand(1));
+      // A constant mask: vmv.v.i / vmv.s.x of a known value, as bits.
+      if (K && (Name.starts_with("PseudoVMV_V_I_") || Name.starts_with("PseudoVMV_S_X")) &&
+          hasUndefPassthru(MI)) {
+        std::optional<int64_t> C = constOperand(MI.getOperand(2), MRI);
+        unsigned EW = 1u << S;
+        uint64_t Elems = Name.starts_with("PseudoVMV_S_X") ? std::min<int64_t>(*K, 1) : *K;
+        if (C) {
+          MaskBits MB{BitVector(N), BitVector(N)};
+          for (unsigned I = 0; I != N; ++I)
+            if (I / EW < Elems) {
+              MB.Known.set(I);
+              if ((uint64_t(*C) >> (I % EW)) & 1)
+                MB.Bits.set(I);
+            }
+          ResMask = MB;
+          // A splat of 0 at v's element width is also a zero vector.
+          if (*C == 0 && S == Log2SEW && Name.starts_with("PseudoVMV_V_I_")) {
+            Form F = Unknown;
+            for (unsigned I = 0; I != N && I < uint64_t(*K); ++I)
+              F.Known.set(I);
+            Res = F;
+          }
+        }
+      } else if (K && S == Log2SEW) {
+        bool Masked = Name.contains("_MASK");
+        if (Name.starts_with("PseudoVMV_V_V_") && !Masked) {
+          if (const Form *Src = Lanes(MI.getOperand(2))) {
+            Form F = Unknown;
+            for (unsigned I = 0; I != N; ++I)
+              CopyLane(F, I, I < uint64_t(*K) ? Src : (TA ? nullptr : Pass), I);
+            Res = F;
+          }
+        } else if (Name.starts_with("PseudoVSLIDEUP_VI_") ||
+                   Name.starts_with("PseudoVSLIDEUP_VX_")) {
+          const Form *Src = Lanes(MI.getOperand(2));
+          std::optional<int64_t> Off = constOperand(MI.getOperand(3), MRI);
+          if (Src && Off && *Off >= 0 && (!Masked || V0)) {
+            Form F = Unknown;
+            for (unsigned I = 0; I != N; ++I) {
+              if (I >= uint64_t(*K)) {
+                CopyLane(F, I, TA ? nullptr : Pass, I);
+              } else if (I < uint64_t(*Off)) {
+                CopyLane(F, I, Pass, I);
+              } else if (Masked && !V0->Known[I]) {
+                // unknown
+              } else if (Masked && !V0->Bits[I]) {
+                CopyLane(F, I, MA ? nullptr : Pass, I);
+              } else {
+                CopyLane(F, I, Src, I - *Off);
+              }
+            }
+            Res = F;
+          }
+        } else if (Name.starts_with("PseudoVADD_VV_") && !Masked) {
+          const Form *A = Lanes(MI.getOperand(2)), *B = Lanes(MI.getOperand(3));
+          if (A && B) {
+            Form F = Unknown;
+            for (unsigned I = 0; I != N; ++I) {
+              if (I >= uint64_t(*K)) {
+                CopyLane(F, I, TA ? nullptr : Pass, I);
+              } else if (A->Known[I] && B->Known[I]) {
+                F.Known.set(I);
+                for (unsigned J = 0; J != N; ++J)
+                  F.Coef[I * N + J] = A->Coef[I * N + J] + B->Coef[I * N + J];
+              }
+            }
+            Res = F;
+          }
+        }
+      }
+    }
+    // Whatever MI writes and was not computed above is no longer known.
+    for (const MachineOperand &MO : MI.all_defs()) {
+      if (MO.getReg() == RISCV::V0 || MI.modifiesRegister(RISCV::V0, TRI))
+        V0.reset();
+      if (!MO.getReg().isVirtual())
+        continue;
+      if (MO.getReg() == Dst && Res && Res->Known.any())
+        Vals[Dst] = *Res;
+      else
+        Vals.erase(MO.getReg());
+      if (MO.getReg() == Dst && ResMask)
+        Masks[Dst] = *ResMask;
+      else
+        Masks.erase(MO.getReg());
+    }
+    if (Dst.isVirtual() && Dst != VIn && Res && IsPrefix(*Res))
+      Found.push_back({Dst, P});
+  }
+
+  StringRef L = lmulSuffix(QName);
+  unsigned Slide = findPseudo(TII, "PseudoVSLIDE1UP_VX_" + L.str()).value_or(0);
+  unsigned Sub = findPseudo(TII, "PseudoVSUB_VV_" + L.str()).value_or(0);
+  if (!Slide || !Sub)
+    return;
+  for (auto [Y, Pos] : Found) {
+    RevPlan P;
+    P.Kind = RevPlan::PrefixSum;
+    P.Fwd = {&Q};
+    P.Ins.push_back({Y, Pos + 1, {{Slide, 2}, {Sub, 2}}});
+    P.Opcs = {Slide, Sub};
+    P.TempW = TRI->getRegClassWeight(MRI.getRegClass(Y)).RegWeight;
+    P.Valid = makeRange(vlOperand(Q), Log2SEW, TII->get(Sub), 1u << Log2SEW);
+    Out.push_back(P);
+  }
+}
+
 namespace {
 // Rematerialization information attached to a live range, as in V8's
 // integrated rematerialization (Vardanyan, Asryan, Buchatskiy, "Integrated
@@ -3046,6 +3489,18 @@ bool ExpandPseudos::ProcessReverseRematChain(MachineFunction &MF) {
         }
         for (auto [QPos, VIn] : Qs) {
           MachineInstr *Q = BM.Instrs[QPos];
+          // A value written through a sub-register (a's data in the low half
+          // of a group) is only rebuilt as a part of a concatenation.
+          if (VR.HasSubRegDef) {
+            SmallVector<RevPlan, 2> Plans;
+            matchConcatPlans(TII, TRI, *MRI, BM, *Q, VIn, Plans);
+            for (RevPlan &Plan : Plans)
+              if (llvm::none_of(Plan.Ins, [&](const RevPlan::Input &In) {
+                    return SameValue(In.Reg, V);
+                  }))
+                LI.Options.push_back({QPos, std::move(Plan)});
+            continue;
+          }
           if (Q->getNumExplicitOperands() >= 6) {
             for (unsigned Vs : {2u, 3u}) {
               const MachineOperand &VOp = Q->getOperand(Vs);
@@ -3089,6 +3544,9 @@ bool ExpandPseudos::ProcessReverseRematChain(MachineFunction &MF) {
           matchFlipPlan(TII, TRI, *MRI, BM, *Q, VIn, Plans);
           matchPermPlan(TII, TRI, *MRI, *MF.getConstantPool(), BM, *Q, VIn,
                         Plans);
+          matchMaskPlan(TII, *MRI, BM, *Q, VIn, Plans);
+          matchConcatPlans(TII, TRI, *MRI, BM, *Q, VIn, Plans);
+          matchPrefixSumPlan(TII, *MRI, BM, *Q, VIn, Plans);
           for (RevPlan &Plan : Plans)
             if (llvm::none_of(Plan.Ins, [&](const RevPlan::Input &In) {
                   return SameValue(In.Reg, V);
@@ -3247,8 +3705,7 @@ bool ExpandPseudos::ProcessReverseRematChain(MachineFunction &MF) {
         const Model::RegRefs &VR = BM.Regs[V];
         // A value read in another block keeps its register past this
         // block's uses anyway.
-        if (!isVectorReg(V, *MRI) || VR.HasSubRegDef || VR.Reads.empty() ||
-            VR.LiveOut)
+        if (!isVectorReg(V, *MRI) || VR.Reads.empty() || VR.LiveOut)
           continue;
         // The register allocator already recomputes a value whose def reads
         // no vector register (e.g. vid.v, vmv.v.x: only VL and scalars)
@@ -3435,7 +3892,8 @@ bool ExpandPseudos::ProcessReverseRematChain(MachineFunction &MF) {
       }
       case RevPlan::Narrow: {
         // One step per halving of SEW (several only for vsext / vzext.vf4
-        // and vf8); every step but the last writes a temporary.
+        // and vf8), then for a widen by k the vsub / vadd.vx of k at v's
+        // SEW; every step but the last writes a temporary.
         Register Src = In0;
         for (unsigned I = 0, E = Plan.Opcs.size(); I != E; ++I) {
           unsigned Opc = Plan.Opcs[I];
@@ -3448,10 +3906,18 @@ bool ExpandPseudos::ProcessReverseRematChain(MachineFunction &MF) {
           MIB.addReg(Dst, RegState::Undef).addReg(Src);
           if (Name.starts_with("PseudoVNSRL_WI"))
             MIB.addImm(0);
+          else if (Name.starts_with("PseudoVSUB_VX") ||
+                   Name.starts_with("PseudoVADD_VX"))
+            MIB.addReg(Q->getOperand(3).getReg()); // k of the widen
           bool ReadsFRM = Name.starts_with("PseudoVFNCVT_F_F");
           if (ReadsFRM) // exact, so any rounding mode will do
             MIB.addImm(RISCVFPRndMode::DYN);
-          AddVLSEW(MIB, *Q, Plan.Valid.Log2SEW + (E - 1 - I));
+          // Each narrow halves SEW; the step's SEW is v's plus the halvings
+          // still to come.
+          unsigned Halvings = 0;
+          for (unsigned J = I + 1; J != E; ++J)
+            Halvings += TII->getName(Plan.Opcs[J]).starts_with("PseudoVNSRL_WI");
+          AddVLSEW(MIB, *Q, Plan.Valid.Log2SEW + Halvings);
           if (ReadsFRM)
             MIB.addReg(RISCV::FRM, RegState::Implicit);
           MIB->setFlag(MachineInstr::NoFPExcept);
@@ -3631,6 +4097,55 @@ bool ExpandPseudos::ProcessReverseRematChain(MachineFunction &MF) {
         MachineInstrBuilder Or = Build(Plan.Opcs[2], NewV);
         Or.addReg(NewV, RegState::Undef).addReg(Lo).addReg(Hi);
         AddVLSEWPolicy(Or, *O);
+        break;
+      }
+      case RevPlan::MaskMerge: {
+        // m = vmsne.vi y, 0 at the merge's VL and SEW (Q is the merge).
+        MachineInstrBuilder MIB = Build(Plan.Opcs[0], NewV);
+        MIB.addReg(In0).addImm(0);
+        AddVLSEW(MIB, *Q, log2SEWOf(*Q));
+        break;
+      }
+      case RevPlan::ConcatLow: {
+        // a's data is Y's low elements: copy the sub-register a's data was
+        // written to (or all of Y), leaving the rest of NewV undefined as
+        // the rest of a was.
+        MachineInstrBuilder MIB =
+            BuildMI(MBB, IP, DL, TII->get(TargetOpcode::COPY));
+        if (Plan.SubIdx)
+          MIB.addReg(NewV, RegState::Define | RegState::Undef, Plan.SubIdx)
+              .addReg(In0, RegState::NoFlags, Plan.SubIdx);
+        else
+          MIB.addReg(NewV, RegState::Define).addReg(In0);
+        NewMIs.push_back(MIB);
+        break;
+      }
+      case RevPlan::ConcatHigh: {
+        // b = vslidedown y, off at b's own VL (Q is the slide up).
+        Register AVL = MRI->createVirtualRegister(&RISCV::GPRNoX0RegClass);
+        NewMIs.push_back(BuildMI(MBB, IP, DL, TII->get(RISCV::ADDI), AVL)
+                             .addReg(RISCV::X0)
+                             .addImm(Plan.DataVL));
+        MachineInstrBuilder MIB = Build(Plan.Opcs[0], NewV);
+        MIB.addReg(NewV, RegState::Undef)
+            .addReg(In0)
+            .add(copyUse(Q->getOperand(3)))
+            .addReg(AVL)
+            .addImm(log2SEWOf(*Q));
+        MIB.addImm(RISCVVType::TAIL_AGNOSTIC | RISCVVType::MASK_AGNOSTIC);
+        break;
+      }
+      case RevPlan::PrefixSum: {
+        // v[i] = y[i] - y[i - 1], v[0] = y[0]: t = vslide1up y, x0 ;
+        // v = y - t, at Q's VL and SEW.
+        Register Tmp = MRI->createVirtualRegister(
+            TII->getRegClass(TII->get(Plan.Opcs[0]), 0));
+        MachineInstrBuilder Slide = Build(Plan.Opcs[0], Tmp);
+        Slide.addReg(Tmp, RegState::Undef).addReg(In0).addReg(RISCV::X0);
+        AddVLSEW(Slide, *Q, log2SEWOf(*Q));
+        MachineInstrBuilder Sub = Build(Plan.Opcs[1], NewV);
+        Sub.addReg(NewV, RegState::Undef).addReg(In0).addReg(Tmp);
+        AddVLSEW(Sub, *Q, log2SEWOf(*Q));
         break;
       }
       }
